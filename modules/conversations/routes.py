@@ -1,0 +1,618 @@
+import asyncio
+import io
+import httpx
+import uuid
+from typing import List, Optional, Dict, Any
+from uuid import UUID
+from pydantic import BaseModel
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Body
+from fastapi.responses import StreamingResponse, FileResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from modules.common.database import get_db
+from modules.common.models import User, Organization, Conversation, Message
+from modules.auth.jwt import get_current_user
+from modules.common.logger import get_logger
+from modules.common.audit import get_audit_service, AuditService
+from modules.message.sender import WhatsAppService, get_whatsapp_config
+from modules.conversations.services import ConversationService
+
+from .schemas import MessageCreate, NoteCreate, TagCreate, AssignAgentRequest, ConversationModeUpdate
+from .utils import get_media_type_and_limit
+
+logger = get_logger(__name__)
+router = APIRouter(prefix="/api/conversations", tags=["Conversations"])
+
+# ---------- Helper: Download and save media ----------
+async def download_and_save_media(media_id: str, filename: str, mime_type: str, org_id: str, message_id: uuid.UUID) -> tuple[str, str]:
+    """Download media from WhatsApp, save locally, return (local_path, local_url)."""
+    config = await get_whatsapp_config(org_id)
+    if not config:
+        raise Exception("WhatsApp config missing")
+    wa = WhatsAppService(config['access_token'], config['phone_number_id'])
+    
+    # Get temporary download URL
+    media_url = await wa.get_media_url(media_id)
+    if not media_url:
+        raise Exception("No media URL")
+    
+    # Download file using the same access token
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(media_url, headers={"Authorization": f"Bearer {wa.access_token}"})
+        if resp.status_code != 200:
+            raise Exception(f"Download failed: {resp.status_code}")
+        content = resp.content
+    
+    # Save to local storage
+    root_dir = Path(__file__).resolve().parents[2]
+    media_dir = root_dir / "storage" / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    ext = filename.split('.')[-1] if '.' in filename else 'bin'
+    local_filename = f"{message_id}.{ext}"
+    local_path = media_dir / local_filename
+    with open(local_path, "wb") as f:
+        f.write(content)
+    
+    local_url = f"/api/conversations/media/{local_filename}"
+    return str(local_path), local_url
+
+# ---------- Dependency Injections ----------
+def get_conversation_service(
+    db: Any = Depends(get_db),
+    audit: Any = Depends(get_audit_service)
+) -> ConversationService:
+    return ConversationService(db, audit)
+
+# WhatsApp official size limits
+SIZE_LIMITS = {
+    "image": 5 * 1024 * 1024,
+    "video": 16 * 1024 * 1024,
+    "audio": 16 * 1024 * 1024,
+    "document": 100 * 1024 * 1024,
+}
+
+# ---------- Local Media Serving Endpoint ----------
+@router.get("/media/{filename}")
+async def serve_local_media(filename: str):
+    """Serve downloaded media files from local storage."""
+    root_dir = Path(__file__).resolve().parents[2]
+    file_path = root_dir / "storage" / "media" / filename
+    if not file_path.exists():
+        raise HTTPException(404, "Media not found")
+    return FileResponse(file_path)
+
+# ---------- Conversation Routes ----------
+@router.get("", response_model=None)
+async def list_conversations(
+    current_user = Depends(get_current_user),
+    service: Any = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    user_id = current_user.get("user_id")
+    user_role = current_user.get("role")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        return await service.list_conversations(UUID(org_id), UUID(user_id), user_role)
+    except Exception as e:
+        logger.error(f"Error listing conversations: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.post("", response_model=None)
+async def create_conversation(
+    phone_number: str = Body(None, embed=True),
+    phone_number_form: str = Form(None),
+    current_user = Depends(get_current_user),
+    service: Any = Depends(get_conversation_service)
+) -> Any:
+    phone_number = phone_number or phone_number_form
+    if not phone_number:
+        raise HTTPException(400, "Phone number is required")
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        return await service.create_or_get_conversation(phone_number, UUID(org_id))
+    except Exception as e:
+        logger.error(f"Error creating conversation: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.get("/search", response_model=None)
+async def search_conversations(
+    q: str = Query(..., description="Search term for phone number or customer name"),
+    current_user = Depends(get_current_user),
+    service: Any = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        return await service.search_conversations(UUID(org_id), q)
+    except Exception as e:
+        logger.error(f"Error searching conversations: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.get("/{conv_id}/messages", response_model=None)
+async def get_messages(
+    conv_id: UUID,
+    limit: int = Query(50, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    current_user = Depends(get_current_user),
+    service: Any = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        return await service.get_conversation_messages(
+            conv_id, UUID(org_id), limit=limit, offset=offset
+        )
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error getting messages: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.post("/{conv_id}/messages", response_model=None)
+async def send_message(
+    conv_id: UUID,
+    message: MessageCreate,
+    current_user = Depends(get_current_user),
+    service: Any = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    user_id = current_user.get("user_id")
+    user_role = current_user.get("role")
+    if not org_id or not user_id:
+        raise HTTPException(403, "Authentication required")
+    try:
+        return await service.send_message(conv_id, message.text, UUID(org_id), UUID(user_id), user_role)
+    except PermissionError as e:
+        raise HTTPException(403, str(e))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error sending message: {e}")
+        raise HTTPException(500, "Internal server error")
+
+# ==================== MEDIA UPLOAD ENDPOINT WITH IMMEDIATE DOWNLOAD ====================
+@router.post("/{conv_id}/media", response_model=None)
+async def upload_media(
+    conv_id: UUID,
+    file: UploadFile = File(...),
+    caption: Optional[str] = Form(None),
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    logger.info(f"upload_media called for conv_id: {conv_id}, file: {file.filename}, size: {file.size}, caption: {caption}")
+    org_id = current_user.get("org_id")
+    user_id = current_user.get("user_id")
+    if not org_id or not user_id:
+        logger.error("Authentication failed - missing org_id or user_id")
+        raise HTTPException(403, "Authentication required")
+
+    if not file.filename:
+        raise HTTPException(400, "Filename missing")
+    mime_type = file.content_type
+    if not mime_type:
+        raise HTTPException(400, "Content-Type missing")
+
+    supported_mime_types = {
+        "image": ["image/jpeg", "image/png", "image/webp"],
+        "video": ["video/mp4", "video/3gpp"],
+        "audio": ["audio/mpeg", "audio/aac", "audio/amr", "audio/ogg"],
+        "document": ["application/pdf", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                     "text/plain", "application/vnd.ms-excel", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]
+    }
+    media_category = None
+    for cat, mimes in supported_mime_types.items():
+        if mime_type in mimes:
+            media_category = cat
+            break
+    if not media_category:
+        raise HTTPException(400, f"Unsupported MIME type: {mime_type}")
+
+    size_limits = {"image": 5*1024*1024, "video": 16*1024*1024, "audio": 16*1024*1024, "document": 100*1024*1024}
+    if file.size is None or file.size == 0:
+        raise HTTPException(400, "Cannot determine file size")
+    max_size = size_limits[media_category]
+    if file.size > max_size:
+        raise HTTPException(400, f"File too large: {file.size/(1024*1024):.1f}MB > {max_size/(1024*1024)}MB")
+
+    if caption and media_category == "audio":
+        raise HTTPException(400, "Captions are not allowed for audio messages")
+
+    conv_result = await db.execute(
+        select(Conversation).where(
+            Conversation.id == conv_id,
+            Conversation.organization_id == UUID(org_id)
+        )
+    )
+    conv = conv_result.scalar_one_or_none()
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+
+    whatsapp_config = await get_whatsapp_config(org_id)
+    if not whatsapp_config:
+        raise HTTPException(400, "WhatsApp configuration missing for this organization")
+
+    file_bytes = await file.read()
+
+    whatsapp_service = WhatsAppService(
+        whatsapp_config['access_token'],
+        whatsapp_config['phone_number_id']
+    )
+    try:
+        media_id = await whatsapp_service.upload_media(str(file.filename), mime_type, file_bytes)
+        logger.info(f"Media uploaded successfully, media_id: {media_id}")
+    except Exception as e:
+        logger.error(f"WhatsApp upload failed: {e}")
+        raise HTTPException(502, f"WhatsApp upload error: {str(e)}")
+
+    try:
+        success, wamid = await whatsapp_service.send_media_message(
+            to_number=conv.customer_phone_number,
+            media_id=media_id,
+            media_type=media_category,
+            caption=caption
+        )
+        if not success:
+            raise HTTPException(502, "Failed to send media message")
+        logger.info(f"Media message sent, wamid: {wamid}")
+    except Exception as e:
+        logger.error(f"Failed to send media message: {e}")
+        raise HTTPException(502, f"Failed to send media: {str(e)}")
+
+    # Generate message ID early for filename
+    message_id = uuid.uuid4()
+    local_path = None
+    local_url = None
+
+    # Try to download immediately
+    try:
+        local_path, local_url = await download_and_save_media(
+            media_id=media_id,
+            filename=file.filename,
+            mime_type=mime_type,
+            org_id=org_id,
+            message_id=message_id
+        )
+        logger.info(f"Media downloaded and saved to {local_path}")
+    except Exception as e:
+        logger.error(f"Immediate media download failed, will rely on webhook: {e}")
+        # Fallback: set local_url to None, webhook will try later
+        local_url = None
+
+    # Create message record with final local URL if available
+    message = Message(
+        id=message_id,
+        conversation_id=conv_id,
+        direction="outgoing",
+        message_type=media_category,
+        content=caption or "",
+        media_whatsapp_id=media_id,
+        media_content_type=mime_type,
+        media_file_name=file.filename,
+        media_file_size=file.size,
+        is_ai_generated=False,
+        human_agent_id=UUID(user_id),
+        status="sent",
+        whatsapp_message_id=wamid,
+        media_url=local_url,                     # final local URL if downloaded, else None
+        local_media_path=local_path if local_url else None,
+        organization_id=UUID(org_id)             # include org_id for webhook lookup
+    )
+    db.add(message)
+    await db.commit()
+    await db.refresh(message)
+
+    logger.info(f"Media uploaded, sent, and saved: message_id={message.id}, media_id={media_id}")
+    return {
+        "message_id": str(message.id),
+        "media_id": media_id,
+        "whatsapp_message_id": wamid,
+        "status": "sent",
+        "media_url": local_url   # return final URL to frontend
+    }
+
+# ==================== MEDIA FETCH ENDPOINT (stream from WhatsApp) ====================
+# Note: This is kept as fallback for older messages without local copy.
+@router.get("/{conv_id}/media/{message_id}", response_model=None)
+async def fetch_message_media(
+    conv_id: UUID,
+    message_id: UUID,
+    db: Any = Depends(get_db),
+    current_user = Depends(get_current_user)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+
+    try:
+        conv_result = await db.execute(
+            select(Conversation).where(
+                Conversation.id == conv_id,
+                Conversation.organization_id == UUID(org_id)
+            )
+        )
+        conv = conv_result.scalar_one_or_none()
+        if not conv:
+            raise HTTPException(404, "Conversation not found")
+
+        msg_result = await db.execute(
+            select(Message).where(
+                Message.id == message_id,
+                Message.conversation_id == conv_id
+            )
+        )
+        message = msg_result.scalar_one_or_none()
+        if not message or not message.media_whatsapp_id:
+            raise HTTPException(404, "Media not found")
+
+        # If we have a local copy, serve it directly (faster)
+        if message.local_media_path and Path(message.local_media_path).exists():
+            return FileResponse(message.local_media_path)
+
+        # Otherwise fallback to streaming from WhatsApp
+        whatsapp_config = await get_whatsapp_config(org_id)
+        if not whatsapp_config:
+            raise HTTPException(400, "WhatsApp configuration missing")
+
+        service = WhatsAppService(
+            whatsapp_config['access_token'],
+            whatsapp_config['phone_number_id']
+        )
+
+        media_url = await service.get_media_url(message.media_whatsapp_id)
+        if not media_url:
+            raise HTTPException(404, "Media URL unavailable")
+
+        async def stream_media():
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                async with client.stream("GET", media_url) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes(chunk_size=8192):
+                        yield chunk
+
+        return StreamingResponse(
+            stream_media(),
+            media_type=message.media_content_type or "application/octet-stream",
+            headers={
+                "Content-Disposition": f'inline; filename="{message.media_file_name or message.id}"'
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching media: {e}")
+        raise HTTPException(500, "Internal server error")
+
+# ---------- Assignment Routes (unchanged) ----------
+@router.post("/{conv_id}/assign", response_model=None)
+async def assign_agent(
+    conv_id: UUID,
+    request: AssignAgentRequest,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    user_role = current_user.get("role")
+
+    if user_role != 'org_admin':
+        raise HTTPException(403, "Only organization admin can assign/unassign agents")
+
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        await service.assign_agent(conv_id, request.agent_id, UUID(org_id))
+        return {"status": "assigned"}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error assigning agent: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.post("/{conv_id}/unassign", response_model=None)
+async def unassign_agent(
+    conv_id: UUID,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    user_role = current_user.get("role")
+    
+    if user_role != 'org_admin':
+        raise HTTPException(403, "Only organization admin can assign/unassign agents")
+
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        await service.unassign_agent(conv_id, UUID(org_id))
+        return {"status": "unassigned"}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error unassigning agent: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.get("/agents", response_model=None)
+async def list_agents(
+    db: Any = Depends(get_db),
+    current_user = Depends(get_current_user)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        from sqlalchemy import or_
+        stmt = select(User).where(
+            User.organization_id == UUID(org_id),
+            or_(
+                User.role == 'agent',
+                User.role == 'org_admin',
+                User.role == 'team_member'   # keep for compatibility
+            )
+        )
+        result = await db.execute(stmt)
+        agents = result.scalars().all()
+        return [
+            {
+                "id": str(agent.id),
+                "name": agent.full_name or agent.email,
+                "email": agent.email,
+                "role": agent.role,
+            }
+            for agent in agents
+        ]
+    except Exception as e:
+        logger.error(f"Error listing agents: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.post("/{conv_id}/mode", response_model=None)
+async def toggle_mode(
+    conv_id: UUID,
+    request: ConversationModeUpdate,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        await service.toggle_mode(conv_id, request.mode, UUID(org_id))
+        return {"status": "updated", "mode": request.mode}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.error(f"Error toggling mode: {e}")
+        raise HTTPException(500, "Internal server error")
+
+# ---------- Notes Routes ----------
+@router.get("/{conv_id}/notes", response_model=None)
+async def get_notes(
+    conv_id: UUID,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        return await service.get_notes(conv_id, UUID(org_id))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error getting notes: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.post("/{conv_id}/notes", response_model=None)
+async def add_note(
+    conv_id: UUID,
+    note: NoteCreate,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    user_id = current_user.get("user_id")
+    if not org_id or not user_id:
+        raise HTTPException(403, "Authentication required")
+    try:
+        return await service.add_note(conv_id, note.note, UUID(org_id), UUID(user_id))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error adding note: {e}")
+        raise HTTPException(500, "Internal server error")
+
+# ---------- Tags Routes ----------
+@router.get("/tags", response_model=None)
+async def list_tags(
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        return await service.list_tags(UUID(org_id))
+    except Exception as e:
+        logger.error(f"Error listing tags: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.post("/tags", response_model=None)
+async def create_tag(
+    tag: TagCreate,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        return await service.create_tag(tag.name, tag.color or "#4F46E5", UUID(org_id))
+    except Exception as e:
+        logger.error(f"Error creating tag: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.post("/{conv_id}/tags/{tag_id}", response_model=None)
+async def attach_tag(
+    conv_id: UUID,
+    tag_id: UUID,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        await service.attach_tag(conv_id, tag_id, UUID(org_id))
+        return {"status": "attached"}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error attaching tag: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.delete("/{conv_id}/tags/{tag_id}", response_model=None)
+async def detach_tag(
+    conv_id: UUID,
+    tag_id: UUID,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        success = await service.detach_tag(conv_id, tag_id, UUID(org_id))
+        if not success:
+            raise HTTPException(404, "Tag not attached")
+        return {"status": "detached"}
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error detaching tag: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.get("/{conv_id}/tags", response_model=None)
+async def get_conversation_tags(
+    conv_id: UUID,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        return await service.get_conversation_tags(conv_id, UUID(org_id))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error getting conversation tags: {e}")
+        raise HTTPException(500, "Internal server error")
