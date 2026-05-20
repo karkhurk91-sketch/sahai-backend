@@ -5,7 +5,8 @@ from sqlalchemy.exc import IntegrityError
 from pathlib import Path
 import httpx
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone # Ensure the import is from datetime, not datetime.datetime
+
 
 from modules.common.config import VERIFY_TOKEN
 from modules.common.database import get_db, AsyncSessionLocal
@@ -125,7 +126,6 @@ async def receive_webhook(
                     continue
 
                 try:
-                    # Update message status
                     await db.execute(
                         update(Message)
                         .where(Message.whatsapp_message_id == wamid)
@@ -134,7 +134,6 @@ async def receive_webhook(
                     await db.commit()
                     logger.info(f"Updated message {wamid} status -> {mapped}")
 
-                    # If status is sent/delivered and this is a media message without local copy, trigger download
                     if raw_status in {"sent", "delivered"}:
                         msg_result = await db.execute(
                             select(Message).where(Message.whatsapp_message_id == wamid)
@@ -166,7 +165,6 @@ async def receive_webhook(
             timestamp = int(msg_data["timestamp"])
             business_phone_number = value["metadata"]["display_phone_number"]
 
-            # Determine incoming message content and type
             msg_type = msg_data.get("type")
             caption = ""
             media_whatsapp_id = None
@@ -190,7 +188,6 @@ async def receive_webhook(
                 content = msg_data.get("text", {}).get("body") or msg_data.get(msg_type, {}).get("caption") or f"Unsupported message type: {msg_type}"
                 message_type = msg_type or "text"
 
-            # Find organization
             result = await db.execute(
                 select(Organization.id, Organization.business_type)
                 .where(Organization.whatsapp_phone_number == business_phone_number)
@@ -201,7 +198,6 @@ async def receive_webhook(
                 return {"status": "ignored", "reason": "unknown_whatsapp_number"}
             org_id, business_type = row
 
-            # Find or create conversation
             conv_stmt = select(Conversation).where(
                 Conversation.organization_id == org_id,
                 Conversation.customer_phone_number == from_number
@@ -232,7 +228,6 @@ async def receive_webhook(
                     conv.reply_mode = 'ai'
                 logger.info(f"Using existing conversation {conv.id} for {from_number}")
 
-            # Save incoming message
             new_message_id = uuid.uuid4()
             new_message = Message(
                 id=new_message_id,
@@ -250,11 +245,24 @@ async def receive_webhook(
                 created_at=datetime.utcnow()
             )
             db.add(new_message)
+
+            # ✅ Increment unread count and set last customer message time
+            if new_message.direction == "inbound":
+                # Create a timezone-naive datetime (which PostgreSQL will interpret as UTC)
+                naive_utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+                
+                await db.execute(
+                    update(Conversation)
+                    .where(Conversation.id == conv.id)
+                    .values(
+                        unread_count=Conversation.unread_count + 1,
+                        last_customer_message_at=naive_utc_now
+                    )
+                )
             conv.last_message_at = datetime.utcnow()
             db.add(conv)
             await db.commit()
 
-            # 🔽 NEW: Trigger background download for incoming media
             if media_whatsapp_id:
                 background_tasks.add_task(
                     download_media_background,
@@ -292,7 +300,6 @@ async def receive_webhook(
                     conv.reply_mode = 'ai'
                     await db.commit()
 
-            # Human or AI Mode
             if conv.reply_mode == 'human':
                 logger.info(f"Conversation {conv.id} in human mode – skipping AI reply")
                 return {"status": "ok"}

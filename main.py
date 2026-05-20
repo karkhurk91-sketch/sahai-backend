@@ -15,6 +15,8 @@ from modules.auth.routes import router as auth_router
 from modules.organizations.routes import router as org_router
 from modules.admin.routes import router as admin_router
 from modules.leads.routes import router as leads_router
+from modules.leads.nurturing_routes import router as nurturing_router
+from modules.leads.followup_routes import router as followup_router
 from modules.broadcast.routes import router as broadcast_router
 from modules.ai_config.routes import router as ai_config_router
 from modules.conversations.routes import router as conv_router
@@ -34,8 +36,6 @@ from modules.partners import router as partners_router
 from modules.team import router as team_router
 from modules.whatsapp_templates import router as whatsapp_templates_router
 from modules.broadcast.groups_routes import router as broadcast_groups_router
-
-
 
 logger = get_logger(__name__)
 app = FastAPI(title=APP_NAME)
@@ -87,6 +87,8 @@ app.include_router(auth_router)
 app.include_router(org_router)
 app.include_router(admin_router)
 app.include_router(leads_router)
+app.include_router(nurturing_router)
+app.include_router(followup_router)
 app.include_router(broadcast_router)
 app.include_router(ai_config_router)
 app.include_router(conv_router)
@@ -107,10 +109,9 @@ app.include_router(team_router)
 app.include_router(whatsapp_templates_router)
 app.include_router(broadcast_groups_router)
 
-
 # ---------- Migration helper ----------
 async def run_migration():
-    sql_path = os.path.join("migrations", "ensure_schema.sql")
+    sql_path = os.path.join("migrations", "add_lead_data_fields.sql")
     if not os.path.exists(sql_path):
         logger.warning(f"Migration file {sql_path} not found, skipping.")
         return

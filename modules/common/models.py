@@ -54,6 +54,8 @@ class Organization(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     partner = relationship("Partner", back_populates="organizations")
+    sla_minutes = Column(Integer, default=60)
+
 
 class Customer(Base):
     __tablename__ = "customers"
@@ -72,6 +74,7 @@ class Customer(Base):
     deleted_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    opt_in = Column(Boolean, default=False)
     __table_args__ = (
         Index("ix_customers_org_phone", organization_id, phone_number, unique=True),
     )
@@ -112,6 +115,9 @@ class Conversation(Base):
     rule_state = Column(JSON, default={})
     closed_at = Column(DateTime(timezone=True))
     assigned_agent_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    unread_count = Column(Integer, default=0)
+    last_customer_message_at = Column(DateTime, nullable=True)  # without timezone=True
+    custom_fields = Column(JSON, default={})
 
 class Message(Base):
     __tablename__ = "messages"
@@ -135,20 +141,44 @@ class Message(Base):
     organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True)
 
 
+class LeadSchema(Base):
+    __tablename__ = "lead_schemas"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"))
+    name = Column(String(100), nullable=False)
+    schema_fields = Column(JSON, nullable=False, default=[])
+    extraction_prompt = Column(Text)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    __table_args__ = (UniqueConstraint('organization_id', 'name'),)
+
 class Lead(Base):
     __tablename__ = "leads"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"))
-    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"))
+    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id"), nullable=True)
     customer_phone = Column(String(20), nullable=False)
     customer_name = Column(String(255))
     email = Column(String(255))
     interest = Column(String(255))
-    budget_range = Column(String(50))
+    data = Column(JSON, default={})
+    schema_id = Column(UUID(as_uuid=True), ForeignKey("lead_schemas.id"), nullable=True)
+    assigned_to = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     status = Column(String(20), default="new")
     notes = Column(Text)
     service = Column(String(100), nullable=True)
     lead_score = Column(Integer, default=0)
+    urgency = Column(String(50), default="medium")
+    intent = Column(String(100), nullable=True)
+    sentiment = Column(String(50), default="neutral")
+    conversion_probability = Column(Float, default=0.0)
+    follow_up_scheduled_at = Column(DateTime(timezone=True), nullable=True)
+    lead_stage = Column(String(50), default="new")
+    rule_state = Column(JSON, default={})
+    active_nurturing_sequence_id = Column(UUID(as_uuid=True), ForeignKey("lead_nurturing_sequences.id"), nullable=True)
+    last_nurturing_step = Column(Integer, default=0)
+    last_nurturing_sent_at = Column(DateTime(timezone=True), nullable=True)
     campaign_id = Column(UUID(as_uuid=True), ForeignKey("campaigns.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
@@ -367,3 +397,44 @@ class CustomerGroupMember(Base):
     group_id = Column(UUID(as_uuid=True), ForeignKey("customer_groups.id", ondelete="CASCADE"), primary_key=True)
     customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id", ondelete="CASCADE"), primary_key=True)
     added_at = Column(DateTime(timezone=True), server_default=func.now())
+
+# Add this class to your existing models.py (after ConversationNote or at the end)
+
+class ConversationAssignmentHistory(Base):
+    __tablename__ = "conversation_assignment_history"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
+    assigned_to = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    assigned_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    assigned_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class LeadNurturingSequence(Base):
+    __tablename__ = "lead_nurturing_sequences"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"))
+    name = Column(String(100), nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class LeadNurturingStep(Base):
+    __tablename__ = "lead_nurturing_steps"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    sequence_id = Column(UUID(as_uuid=True), ForeignKey("lead_nurturing_sequences.id", ondelete="CASCADE"))
+    step_order = Column(Integer, nullable=False)
+    delay_days = Column(Integer, nullable=False)
+    template_id = Column(UUID(as_uuid=True), ForeignKey("broadcast_templates.id", ondelete="SET NULL"), nullable=True)
+    custom_message = Column(Text)
+    condition = Column(JSON, default={})
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class LeadNurturingLog(Base):
+    __tablename__ = "lead_nurturing_log"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    lead_id = Column(UUID(as_uuid=True), ForeignKey("leads.id", ondelete="CASCADE"))
+    step_id = Column(UUID(as_uuid=True), ForeignKey("lead_nurturing_steps.id"))
+    sent_at = Column(DateTime(timezone=True), server_default=func.now())
+    status = Column(String(20), default="sent")
+    error_message = Column(Text)

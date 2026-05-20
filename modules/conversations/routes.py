@@ -1,3 +1,4 @@
+# modules/conversations/routes.py
 import asyncio
 import io
 import httpx
@@ -18,6 +19,7 @@ from modules.auth.jwt import get_current_user
 from modules.common.logger import get_logger
 from modules.common.audit import get_audit_service, AuditService
 from modules.message.sender import WhatsAppService, get_whatsapp_config
+
 from modules.conversations.services import ConversationService
 
 from .schemas import MessageCreate, NoteCreate, TagCreate, AssignAgentRequest, ConversationModeUpdate
@@ -28,25 +30,18 @@ router = APIRouter(prefix="/api/conversations", tags=["Conversations"])
 
 # ---------- Helper: Download and save media ----------
 async def download_and_save_media(media_id: str, filename: str, mime_type: str, org_id: str, message_id: uuid.UUID) -> tuple[str, str]:
-    """Download media from WhatsApp, save locally, return (local_path, local_url)."""
     config = await get_whatsapp_config(org_id)
     if not config:
         raise Exception("WhatsApp config missing")
     wa = WhatsAppService(config['access_token'], config['phone_number_id'])
-    
-    # Get temporary download URL
     media_url = await wa.get_media_url(media_id)
     if not media_url:
         raise Exception("No media URL")
-    
-    # Download file using the same access token
     async with httpx.AsyncClient() as client:
         resp = await client.get(media_url, headers={"Authorization": f"Bearer {wa.access_token}"})
         if resp.status_code != 200:
             raise Exception(f"Download failed: {resp.status_code}")
         content = resp.content
-    
-    # Save to local storage
     root_dir = Path(__file__).resolve().parents[2]
     media_dir = root_dir / "storage" / "media"
     media_dir.mkdir(parents=True, exist_ok=True)
@@ -55,7 +50,6 @@ async def download_and_save_media(media_id: str, filename: str, mime_type: str, 
     local_path = media_dir / local_filename
     with open(local_path, "wb") as f:
         f.write(content)
-    
     local_url = f"/api/conversations/media/{local_filename}"
     return str(local_path), local_url
 
@@ -77,7 +71,6 @@ SIZE_LIMITS = {
 # ---------- Local Media Serving Endpoint ----------
 @router.get("/media/{filename}")
 async def serve_local_media(filename: str):
-    """Serve downloaded media files from local storage."""
     root_dir = Path(__file__).resolve().parents[2]
     file_path = root_dir / "storage" / "media" / filename
     if not file_path.exists():
@@ -87,6 +80,7 @@ async def serve_local_media(filename: str):
 # ---------- Conversation Routes ----------
 @router.get("", response_model=None)
 async def list_conversations(
+    filter: Optional[str] = Query(None, description="Filter: assigned_to_me, unassigned, sla_breached"),
     current_user = Depends(get_current_user),
     service: Any = Depends(get_conversation_service)
 ) -> Any:
@@ -96,7 +90,7 @@ async def list_conversations(
     if not org_id:
         raise HTTPException(403, "Organization not found")
     try:
-        return await service.list_conversations(UUID(org_id), UUID(user_id), user_role)
+        return await service.list_conversations(UUID(org_id), UUID(user_id), user_role, filter)
     except Exception as e:
         logger.error(f"Error listing conversations: {e}")
         raise HTTPException(500, "Internal server error")
@@ -127,10 +121,12 @@ async def search_conversations(
     service: Any = Depends(get_conversation_service)
 ) -> Any:
     org_id = current_user.get("org_id")
+    user_id = current_user.get("user_id")
+    user_role = current_user.get("role")
     if not org_id:
         raise HTTPException(403, "Organization not found")
     try:
-        return await service.search_conversations(UUID(org_id), q)
+        return await service.search_conversations(UUID(org_id), q, UUID(user_id), user_role)
     except Exception as e:
         logger.error(f"Error searching conversations: {e}")
         raise HTTPException(500, "Internal server error")
@@ -178,7 +174,7 @@ async def send_message(
         logger.error(f"Error sending message: {e}")
         raise HTTPException(500, "Internal server error")
 
-# ==================== MEDIA UPLOAD ENDPOINT WITH IMMEDIATE DOWNLOAD ====================
+# ==================== MEDIA UPLOAD ENDPOINT ====================
 @router.post("/{conv_id}/media", response_model=None)
 async def upload_media(
     conv_id: UUID,
@@ -267,12 +263,10 @@ async def upload_media(
         logger.error(f"Failed to send media message: {e}")
         raise HTTPException(502, f"Failed to send media: {str(e)}")
 
-    # Generate message ID early for filename
     message_id = uuid.uuid4()
     local_path = None
     local_url = None
 
-    # Try to download immediately
     try:
         local_path, local_url = await download_and_save_media(
             media_id=media_id,
@@ -284,14 +278,12 @@ async def upload_media(
         logger.info(f"Media downloaded and saved to {local_path}")
     except Exception as e:
         logger.error(f"Immediate media download failed, will rely on webhook: {e}")
-        # Fallback: set local_url to None, webhook will try later
         local_url = None
 
-    # Create message record with final local URL if available
     message = Message(
         id=message_id,
         conversation_id=conv_id,
-        direction="outgoing",
+        direction="outbound",
         message_type=media_category,
         content=caption or "",
         media_whatsapp_id=media_id,
@@ -302,9 +294,9 @@ async def upload_media(
         human_agent_id=UUID(user_id),
         status="sent",
         whatsapp_message_id=wamid,
-        media_url=local_url,                     # final local URL if downloaded, else None
+        media_url=local_url,
         local_media_path=local_path if local_url else None,
-        organization_id=UUID(org_id)             # include org_id for webhook lookup
+        organization_id=UUID(org_id)
     )
     db.add(message)
     await db.commit()
@@ -316,11 +308,10 @@ async def upload_media(
         "media_id": media_id,
         "whatsapp_message_id": wamid,
         "status": "sent",
-        "media_url": local_url   # return final URL to frontend
+        "media_url": local_url
     }
 
-# ==================== MEDIA FETCH ENDPOINT (stream from WhatsApp) ====================
-# Note: This is kept as fallback for older messages without local copy.
+# ==================== MEDIA FETCH ENDPOINT ====================
 @router.get("/{conv_id}/media/{message_id}", response_model=None)
 async def fetch_message_media(
     conv_id: UUID,
@@ -353,11 +344,9 @@ async def fetch_message_media(
         if not message or not message.media_whatsapp_id:
             raise HTTPException(404, "Media not found")
 
-        # If we have a local copy, serve it directly (faster)
         if message.local_media_path and Path(message.local_media_path).exists():
             return FileResponse(message.local_media_path)
 
-        # Otherwise fallback to streaming from WhatsApp
         whatsapp_config = await get_whatsapp_config(org_id)
         if not whatsapp_config:
             raise HTTPException(400, "WhatsApp configuration missing")
@@ -391,7 +380,7 @@ async def fetch_message_media(
         logger.error(f"Error fetching media: {e}")
         raise HTTPException(500, "Internal server error")
 
-# ---------- Assignment Routes (unchanged) ----------
+# ---------- Assignment Routes ----------
 @router.post("/{conv_id}/assign", response_model=None)
 async def assign_agent(
     conv_id: UUID,
@@ -400,15 +389,11 @@ async def assign_agent(
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
     org_id = current_user.get("org_id")
-    user_role = current_user.get("role")
-
-    if user_role != 'org_admin':
-        raise HTTPException(403, "Only organization admin can assign/unassign agents")
-
+    user_id = current_user.get("user_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
     try:
-        await service.assign_agent(conv_id, request.agent_id, UUID(org_id))
+        await service.assign_agent(conv_id, request.agent_id, UUID(org_id), UUID(user_id))
         return {"status": "assigned"}
     except ValueError as e:
         raise HTTPException(404, str(e))
@@ -423,15 +408,11 @@ async def unassign_agent(
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
     org_id = current_user.get("org_id")
-    user_role = current_user.get("role")
-    
-    if user_role != 'org_admin':
-        raise HTTPException(403, "Only organization admin can assign/unassign agents")
-
+    user_id = current_user.get("user_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
     try:
-        await service.unassign_agent(conv_id, UUID(org_id))
+        await service.unassign_agent(conv_id, UUID(org_id), UUID(user_id))
         return {"status": "unassigned"}
     except ValueError as e:
         raise HTTPException(404, str(e))
@@ -454,7 +435,7 @@ async def list_agents(
             or_(
                 User.role == 'agent',
                 User.role == 'org_admin',
-                User.role == 'team_member'   # keep for compatibility
+                User.role == 'team_member'
             )
         )
         result = await db.execute(stmt)
@@ -471,7 +452,6 @@ async def list_agents(
     except Exception as e:
         logger.error(f"Error listing agents: {e}")
         raise HTTPException(500, "Internal server error")
-
 @router.post("/{conv_id}/mode", response_model=None)
 async def toggle_mode(
     conv_id: UUID,
@@ -615,4 +595,96 @@ async def get_conversation_tags(
         raise HTTPException(404, str(e))
     except Exception as e:
         logger.error(f"Error getting conversation tags: {e}")
+        raise HTTPException(500, "Internal server error")
+
+# ---------- NEW ENDPOINTS for DoubleTick UI ----------
+class MetadataUpdate(BaseModel):
+    metadata: Dict[str, Any]
+
+class OptInUpdate(BaseModel):
+    opt_in: bool
+
+@router.get("/counts", response_model=None)
+async def get_conversation_counts(
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    user_id = current_user.get("user_id")
+    user_role = current_user.get("role")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    counts = await service.get_conversation_counts(UUID(org_id), UUID(user_id), user_role)
+    return counts
+
+@router.put("/{conv_id}/mark-read", response_model=None)
+async def mark_conversation_read(
+    conv_id: UUID,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    await service.mark_conversation_read(conv_id, UUID(org_id))
+    return {"status": "read"}
+
+# Also ensure the PATCH /custom-fields and other new endpoints are added (as provided earlier)
+@router.get("/{conv_id}/assignment-history", response_model=None)
+async def get_assignment_history(
+    conv_id: UUID,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        history = await service.get_assignment_history(conv_id, UUID(org_id))
+        return history
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error getting history: {e}")
+        raise HTTPException(500, "Internal server error")
+
+class CustomFieldsUpdate(BaseModel):
+    custom_fields: Dict[str, Any]
+
+@router.patch("/{conv_id}/custom-fields", response_model=None)
+async def update_conversation_custom_fields(
+    conv_id: UUID,
+    data: CustomFieldsUpdate,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        await service.update_custom_fields(conv_id, UUID(org_id), data.custom_fields)
+        return {"status": "updated"}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error updating custom fields: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.put("/customers/{cust_id}/opt-in", response_model=None)
+async def update_customer_optin(
+    cust_id: UUID,
+    data: OptInUpdate,
+    current_user = Depends(get_current_user),
+    service: ConversationService = Depends(get_conversation_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        await service.update_customer_optin(cust_id, UUID(org_id), data.opt_in)
+        return {"status": "updated"}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error updating opt-in: {e}")
         raise HTTPException(500, "Internal server error")

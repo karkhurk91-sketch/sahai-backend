@@ -17,6 +17,7 @@ class ConversationRepository(BaseRepository[Conversation]):
         )
         return result.scalars().all()
 
+    # Inside ConversationRepository class
     async def get_by_agent_id(self, org_id: UUID, agent_id: UUID) -> List[Conversation]:
         result = await self.session.execute(
             select(Conversation)
@@ -26,8 +27,8 @@ class ConversationRepository(BaseRepository[Conversation]):
             )
             .order_by(desc(Conversation.last_message_at))
         )
-        return result.scalars().all()
-
+        return result.scalars().all()   
+         
     async def get_by_phone_and_org(self, phone_number: str, org_id: UUID) -> Optional[Conversation]:
         result = await self.session.execute(
             select(Conversation).where(
