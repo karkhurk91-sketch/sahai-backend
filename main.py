@@ -1,13 +1,21 @@
-from fastapi import FastAPI
+import os
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.utils import get_openapi
-import os
 from sqlalchemy import text
 
 from modules.common.config import APP_NAME
 from modules.common.database import engine, Base
 from modules.common.logger import get_logger
+from modules.websocket import manager
+
 
 # Import all routers
 from modules.message.webhook import router as webhook_router
@@ -144,3 +152,12 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "healthy"}
+
+@app.websocket("/ws/alerts")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # keep alive
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)

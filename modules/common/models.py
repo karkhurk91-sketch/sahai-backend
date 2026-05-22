@@ -1,6 +1,7 @@
 from sqlalchemy import Column, String, Integer, Boolean, DateTime, JSON, Text, Float, ForeignKey, Index, Date, Time, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, ARRAY
 from sqlalchemy.sql import func
+from sqlalchemy.types import PickleType   # <-- ADD THIS LINE
 from modules.common.database import Base
 from sqlalchemy.orm import relationship
 import uuid
@@ -182,6 +183,17 @@ class Lead(Base):
     campaign_id = Column(UUID(as_uuid=True), ForeignKey("campaigns.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    # Inside Lead class add:
+    sentiment_score = Column(Float, default=0.0)
+    intent_label = Column(String(50), nullable=True)
+    embedding = Column(PickleType, nullable=True)  # or use PGVector if available
+    last_scored_at = Column(DateTime, nullable=True)
+    assignee = relationship("User", foreign_keys=[assigned_to], backref="assigned_leads")
+    schema = relationship("LeadSchema", foreign_keys=[schema_id], backref="leads")
+    active_nurturing_sequence = relationship("LeadNurturingSequence", foreign_keys=[active_nurturing_sequence_id])
+    nurturing_logs = relationship("LeadNurturingLog", back_populates="lead", cascade="all, delete-orphan")
+    conversation = relationship("Conversation", foreign_keys=[conversation_id], backref="lead")
+    duplicate_checked = Column(Boolean, default=False)
 
 class AIConfig(Base):
     __tablename__ = "ai_configurations"
@@ -438,3 +450,4 @@ class LeadNurturingLog(Base):
     sent_at = Column(DateTime(timezone=True), server_default=func.now())
     status = Column(String(20), default="sent")
     error_message = Column(Text)
+    lead = relationship("Lead", back_populates="nurturing_logs")
