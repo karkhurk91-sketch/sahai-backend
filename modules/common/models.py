@@ -183,7 +183,6 @@ class Lead(Base):
     campaign_id = Column(UUID(as_uuid=True), ForeignKey("campaigns.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
-    # Inside Lead class add:
     sentiment_score = Column(Float, default=0.0)
     intent_label = Column(String(50), nullable=True)
     embedding = Column(PickleType, nullable=True)  # or use PGVector if available
