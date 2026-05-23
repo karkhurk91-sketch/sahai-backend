@@ -73,7 +73,7 @@ class MessageRepository(BaseRepository[Message]):
         result = await self.session.execute(
             select(Message)
             .where(Message.conversation_id == conv_id)
-            .order_by(Message.created_at.asc())
+            .order_by(Message.sort_timestamp.asc(), Message.id.asc())
             .limit(limit)
             .offset(offset)
         )

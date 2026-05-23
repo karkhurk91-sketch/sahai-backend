@@ -1,10 +1,11 @@
-import asyncio
 import uuid
+import asyncio
 from datetime import datetime, timedelta
 from sqlalchemy import text, select
 from modules.ai.agent import get_agent_for_user_compat
 from modules.ai.lead_capture import create_lead
 from modules.ai.lead_extractor import extract_lead_from_conversation
+from modules.ai.memory_manager import MemoryManager
 from modules.common.database import sync_engine, AsyncSessionLocal
 from modules.common.models import Conversation, Message, LeadSchema
 from modules.common.logger import get_logger
@@ -12,6 +13,8 @@ from modules.leads.assignment_engine import auto_assign_lead, determine_lead_int
 from modules.message.sender import send_whatsapp_text, send_whatsapp_template
 
 logger = get_logger(__name__)
+memory_manager = MemoryManager()
+
 
 def has_recent_customer_message(customer_phone: str, org_id: str) -> bool:
     cutoff = datetime.utcnow() - timedelta(hours=24)
@@ -30,6 +33,7 @@ def has_recent_customer_message(customer_phone: str, org_id: str) -> bool:
         )
         return result.fetchone() is not None
 
+
 def get_lead_capture_enabled(org_id: str) -> bool:
     try:
         with sync_engine.connect() as conn:
@@ -42,6 +46,7 @@ def get_lead_capture_enabled(org_id: str) -> bool:
     except Exception as e:
         logger.error(f"Error checking lead capture config: {e}")
         return True
+
 
 async def process_incoming_message(message: dict):
     conversation_id = message.get("conversation_id")
@@ -62,6 +67,7 @@ async def process_incoming_message(message: dict):
         timestamp=timestamp
     )
 
+
 async def _process_and_reply(
     conversation_id: str,
     customer_phone: str,
@@ -75,30 +81,45 @@ async def _process_and_reply(
     lead_capture_enabled = get_lead_capture_enabled(org_id)
     logger.info(f"Lead capture enabled: {lead_capture_enabled}")
 
+    org_uuid = uuid.UUID(org_id) if isinstance(org_id, str) else org_id
+    conv_uuid = uuid.UUID(conversation_id) if isinstance(conversation_id, str) else conversation_id
+
+    # ----- Load AI memory (long‑term and short‑term) -----
+    try:
+        context = await memory_manager.get_context(str(conv_uuid))
+        logger.debug(f"Loaded memory for conversation {conv_uuid}: {context}")
+    except Exception as e:
+        logger.error(f"Failed to load memory: {e}")
+        context = {"facts": {}, "summary": ""}
+
+    # ----- Get AI agent (industry‑aware) -----
     agent = get_agent_for_user_compat(customer_phone, org_id)
+    # Optionally, you can inject context into agent's prompt here (not implemented in this version)
     ai_response = agent.predict(customer_message)
     logger.info(f"AI response (first 200 chars): {ai_response[:200]}")
 
     lead_data = getattr(agent, '_pending_lead', None)
     logger.info(f"Raw lead_data from agent: {lead_data} (type: {type(lead_data)})")
 
+    # ----- Lead extraction using schema -----
     lead_schema = None
     extracted_lead_data = {}
     conversation = None
     history = []
+
     if lead_capture_enabled:
         try:
             async with AsyncSessionLocal() as db:
                 schema_result = await db.execute(
                     select(LeadSchema)
-                    .where(LeadSchema.organization_id == uuid.UUID(org_id), LeadSchema.is_active == True)
+                    .where(LeadSchema.organization_id == org_uuid, LeadSchema.is_active == True)
                     .order_by(LeadSchema.updated_at.desc())
                 )
                 lead_schema = schema_result.scalars().first()
-                conversation = await db.get(Conversation, uuid.UUID(conversation_id))
+                conversation = await db.get(Conversation, conv_uuid)
                 message_result = await db.execute(
                     select(Message)
-                    .where(Message.conversation_id == uuid.UUID(conversation_id))
+                    .where(Message.conversation_id == conv_uuid)
                     .order_by(Message.created_at.desc())
                     .limit(10)
                 )
@@ -120,13 +141,18 @@ async def _process_and_reply(
         except Exception as e:
             logger.error(f"Lead schema extraction failed: {e}", exc_info=True)
 
-    # --- Lead extraction: handle dictionary or boolean lead_data ---
+    # ----- Determine lead flag and basic fields -----
     is_lead = False
-    interest = customer_message[:100]  # fallback interest
+    interest = customer_message[:100]
     service = None
     score = 70
 
-    if lead_capture_enabled and lead_data is not None:
+    if lead_capture_enabled and extracted_lead_data:
+        is_lead = True
+        interest = extracted_lead_data.get('interest', customer_message[:100])
+        service = extracted_lead_data.get('service')
+        score = extracted_lead_data.get('lead_score', 70)
+    elif lead_data is not None:
         if isinstance(lead_data, dict):
             if 'lead' in lead_data:
                 is_lead = lead_data.get('lead', False)
@@ -140,14 +166,8 @@ async def _process_and_reply(
                 score = lead_data.get('score', 70)
         elif isinstance(lead_data, bool):
             is_lead = lead_data
-        else:
-            logger.warning(f"Unhandled lead_data type: {type(lead_data)}")
 
-    if extracted_lead_data:
-        is_lead = True
-        score = int(extracted_lead_data.get('lead_score', score) or score)
-
-    # Send reply
+    # ----- Send AI reply -----
     if recent:
         success, wamid = await send_whatsapp_text(to_number=customer_phone, text=ai_response, org_id=str(org_id))
     else:
@@ -165,12 +185,12 @@ async def _process_and_reply(
 
     logger.info(f"Reply sent to {customer_phone}")
 
-    # Store AI message
+    # ----- Store AI message in DB -----
     async with AsyncSessionLocal() as db:
         try:
             ai_msg = Message(
                 id=uuid.uuid4(),
-                conversation_id=conversation_id,
+                conversation_id=conv_uuid,
                 direction="outbound",
                 message_type="text",
                 content=ai_response,
@@ -190,74 +210,77 @@ async def _process_and_reply(
             logger.error(f"Failed to store message: {e}")
             await db.rollback()
 
-    # --- Lead creation (only if is_lead is True) ---
+    # ----- Lead creation / update -----
     if is_lead:
-        # Ensure score is integer
         try:
-            score = int(score)
-        except (TypeError, ValueError):
-            score = 70
+            try:
+                score = int(score)
+            except (TypeError, ValueError):
+                score = 70
 
-        try:
-            intelligence = await determine_lead_intelligence(history, extracted_lead_data or {
+            intelligence = await determine_lead_intelligence(
+                history,
+                extracted_lead_data or {
+                    "interest": interest,
+                    "service": service,
+                    "lead_score": score,
+                }
+            )
+
+            final_lead_data = extracted_lead_data.copy() if extracted_lead_data else {}
+            final_lead_data.update({
                 "interest": interest,
                 "service": service,
                 "lead_score": score,
+                "urgency": extracted_lead_data.get('urgency') or intelligence.get('urgency', 'medium'),
+                "intent": extracted_lead_data.get('intent') or intelligence.get('intent', 'general'),
+                "sentiment": extracted_lead_data.get('sentiment') or intelligence.get('sentiment', 'neutral'),
+                "conversion_probability": extracted_lead_data.get('conversion_probability') or intelligence.get('conversion_probability', 0.0),
+                "lead_stage": intelligence.get('lead_stage', 'new'),
+                "rule_state": intelligence.get('rule_state', {}),
+                "follow_up_scheduled_at": intelligence.get('follow_up_scheduled_at')
             })
 
-            urgency_value = extracted_lead_data.get('urgency') or intelligence.get('urgency')
-            intent_value = extracted_lead_data.get('intent') or intelligence.get('intent')
-            sentiment_value = extracted_lead_data.get('sentiment') or intelligence.get('sentiment')
-            conversion_probability_value = extracted_lead_data.get('conversion_probability') or intelligence.get('conversion_probability')
-            score_value = extracted_lead_data.get('lead_score') or score
-            interest_value = extracted_lead_data.get('interest') or interest
-            service_value = extracted_lead_data.get('service') if extracted_lead_data.get('service') is not None else service
+            await create_lead(
+                org_id=str(org_uuid),
+                customer_phone=customer_phone,
+                extracted_data=final_lead_data,
+                schema_id=str(lead_schema.id) if lead_schema else None,
+                conversation_id=conversation_id,
+                customer_name=conversation.customer_name if conversation else "",
+                lead_score=score,
+                interest=interest,
+                service=service,
+                urgency=final_lead_data['urgency'],
+                intent=final_lead_data['intent'],
+                sentiment=final_lead_data['sentiment'],
+                conversion_probability=final_lead_data['conversion_probability'],
+                follow_up_scheduled_at=final_lead_data['follow_up_scheduled_at'],
+                lead_stage=final_lead_data['lead_stage'],
+                rule_state=final_lead_data['rule_state']
+            )
+            await auto_assign_lead(str(org_uuid), conversation_id, final_lead_data)
+            logger.info(f"Lead created/updated for {customer_phone}")
 
-            if extracted_lead_data:
-                logger.info(f"Creating schema-backed lead for conversation {conversation_id}")
-                await create_lead(
-                    org_id,
-                    customer_phone,
-                    extracted_data=extracted_lead_data,
-                    schema_id=str(lead_schema.id) if lead_schema else None,
-                    conversation_id=conversation_id,
-                    customer_name=(conversation.customer_name if conversation else ""),
-                    lead_score=score_value,
-                    interest=interest_value,
-                    service=service_value,
-                    urgency=urgency_value,
-                    intent=intent_value,
-                    sentiment=sentiment_value,
-                    conversion_probability=conversion_probability_value,
-                    follow_up_scheduled_at=intelligence.get("follow_up_scheduled_at"),
-                    lead_stage=intelligence.get("lead_stage"),
-                    rule_state=intelligence.get("rule_state")
-                )
-                await auto_assign_lead(org_id, conversation_id, extracted_lead_data)
-            else:
-                logger.info(f"Fallback lead creation: org={org_id}, phone={customer_phone}, interest={interest}, service={service}, score={score}")
-                await create_lead(
-                    org_id,
-                    customer_phone,
-                    extracted_data={},
-                    schema_id=None,
-                    conversation_id=conversation_id,
-                    customer_name=(conversation.customer_name if conversation else ""),
-                    lead_score=score_value,
-                    interest=interest_value,
-                    service=service_value,
-                    urgency=urgency_value,
-                    intent=intent_value,
-                    sentiment=sentiment_value,
-                    conversion_probability=conversion_probability_value,
-                    follow_up_scheduled_at=intelligence.get("follow_up_scheduled_at"),
-                    lead_stage=intelligence.get("lead_stage"),
-                    rule_state=intelligence.get("rule_state")
-                )
-                await auto_assign_lead(org_id, conversation_id, extracted_lead_data or {"service": service, "interest": interest})
-            logger.info(f"Lead created for {customer_phone}")
+            # ----- Update AI memory with new facts -----
+            facts_to_store = {
+                "last_intent": final_lead_data.get('intent'),
+                "last_sentiment": final_lead_data.get('sentiment'),
+                "lead_score": score,
+                "extracted_fields": {k: v for k, v in final_lead_data.items() if k in ["interest", "service", "budget_range"]}
+            }
+            await memory_manager.update_facts(str(conv_uuid), facts_to_store)
+
         except Exception as e:
             logger.error(f"Lead creation failed: {e}", exc_info=True)
     else:
         logger.info(f"Lead NOT created. lead_data={lead_data}, extracted_lead_data={extracted_lead_data}, lead_capture_enabled={lead_capture_enabled}")
 
+    # ----- Save conversation summary into memory (always) -----
+    try:
+        await memory_manager.save_context(str(conv_uuid), {
+            "facts": context.get("facts", {}),
+            "summary": f"Last message: {customer_message[:200]}... AI replied: {ai_response[:200]}..."
+        })
+    except Exception as e:
+        logger.error(f"Failed to save memory: {e}")

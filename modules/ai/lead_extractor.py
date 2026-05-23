@@ -8,7 +8,7 @@ DEFAULT_MODEL = "llama-3.3-70b-versatile"
 
 
 def _format_field_description(field: Dict[str, Any]) -> str:
-    name = field.get("name") or field.get("field_name") or "unknown"
+    name = field.get("name") or field.get("field_name") or field.get("key") or "unknown"
     label = field.get("label") or name
     field_type = field.get("type") or field.get("field_type") or "string"
     required = field.get("required", False)
@@ -106,7 +106,10 @@ async def extract_lead_from_conversation(
 
         normalized: Dict[str, Any] = {}
         for field in schema_fields:
-            name = field.get("name") or field.get("field_name")
+            # Get field name from either 'name', 'field_name', or 'key'
+            name = field.get("name") or field.get("field_name") or field.get("key")
+            if not name:
+                continue
             field_type = field.get("type") or field.get("field_type") or "string"
             if name in extracted:
                 normalized[name] = _normalize_value(extracted[name], field_type)

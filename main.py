@@ -14,8 +14,7 @@ from sqlalchemy import text
 from modules.common.config import APP_NAME
 from modules.common.database import engine, Base
 from modules.common.logger import get_logger
-from modules.websocket import manager
-
+from modules.websocket import manager 
 
 # Import all routers
 from modules.message.webhook import router as webhook_router
@@ -117,26 +116,14 @@ app.include_router(team_router)
 app.include_router(whatsapp_templates_router)
 app.include_router(broadcast_groups_router)
 
-# ---------- Migration helper ----------
-async def run_migration():
-    sql_path = os.path.join("migrations", "add_lead_data_fields.sql")
-    if not os.path.exists(sql_path):
-        logger.warning(f"Migration file {sql_path} not found, skipping.")
-        return
-    with open(sql_path, "r") as f:
-        sql_script = f.read()
-    async with engine.begin() as conn:
-        for statement in sql_script.split(";"):
-            if statement.strip():
-                await conn.execute(text(statement))
-        logger.info("Database schema migration applied.")
+
 
 # ---------- Startup / Shutdown ----------
 @app.on_event("startup")
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    await run_migration()
+    #await run_migration()
     logger.info("Database tables initialized and schema up to date")
 
 @app.on_event("shutdown")
@@ -158,6 +145,6 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            await websocket.receive_text()  # keep alive
+            await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)

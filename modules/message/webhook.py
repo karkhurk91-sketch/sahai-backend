@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Request, HTTPException, Depends, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, insert
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from pathlib import Path
 import httpx
@@ -10,24 +11,25 @@ from datetime import datetime, timezone
 
 from modules.common.config import VERIFY_TOKEN
 from modules.common.database import get_db, AsyncSessionLocal
-from modules.common.models import Organization, Conversation, Message, Lead  # added Lead
+from modules.common.models import Organization, Conversation, Message, Lead
 from modules.ai.processor import process_incoming_message
 from modules.ai.rule_processor import get_rule_reply
 from modules.message.sender import send_whatsapp_text, get_whatsapp_config, WhatsAppService
 from modules.common.logger import get_logger
 
-# NEW ML IMPORTS
+# ML imports
 from modules.ml.sentiment import analyze_sentiment
 from modules.ml.intent import simple_intent
 from modules.ml.scoring import predict_conversion_probability
 from modules.ml.feature_extractor import extract_features_for_lead
-from modules.ml.duplicates import get_embedding, find_duplicates
+from modules.ml.duplicates import get_embedding
 from modules.websocket import send_alert
+from modules.tasks.message_tasks import process_message_task
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/webhook", tags=["WhatsApp"])
 
-# ---------- Background Media Download (unchanged) ----------
+
 async def download_media_background(
     message_id: uuid.UUID,
     media_id: str,
@@ -36,7 +38,7 @@ async def download_media_background(
     filename: str,
     mime_type: str
 ):
-    """Download media from WhatsApp and save locally (used for both incoming & outgoing)."""
+    """Download media from WhatsApp and save locally."""
     try:
         config = await get_whatsapp_config(org_id)
         if not config:
@@ -45,13 +47,11 @@ async def download_media_background(
 
         wa = WhatsAppService(config['access_token'], config['phone_number_id'])
 
-        # Get temporary download URL from WhatsApp
         media_url = await wa.get_media_url(media_id)
         if not media_url:
             logger.error(f"No media URL for media_id {media_id}")
             return
 
-        # Download the file using the same access token
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 media_url,
@@ -62,7 +62,6 @@ async def download_media_background(
                 return
             content = resp.content
 
-        # Save to local storage
         root_dir = Path(__file__).resolve().parents[2]
         media_dir = root_dir / "storage" / "media"
         media_dir.mkdir(parents=True, exist_ok=True)
@@ -73,7 +72,6 @@ async def download_media_background(
             f.write(content)
         logger.info(f"Media saved locally: {local_path}")
 
-        # Update message record with local path and local media URL
         async with AsyncSessionLocal() as session:
             stmt = update(Message).where(Message.id == message_id).values(
                 local_media_path=str(local_path),
@@ -87,110 +85,82 @@ async def download_media_background(
         logger.error(f"Media download failed for message {message_id}: {e}", exc_info=True)
 
 
-# ---------- NEW: Background ML Processing ----------
 async def process_lead_ml_background(lead_id: uuid.UUID, conversation_id: uuid.UUID, message_text: str):
-    """
-    Runs sentiment, intent, scoring, and duplicate detection on a lead.
-    Runs as a background task to avoid blocking webhook response.
-    """
+    """Run sentiment, intent, scoring, and duplicate detection on a lead."""
     try:
         async with AsyncSessionLocal() as session:
-            # Fetch lead and conversation messages
             lead = await session.get(Lead, lead_id)
             if not lead:
                 logger.error(f"Lead {lead_id} not found")
                 return
 
-            # 1. Sentiment analysis on the incoming message
             sentiment = analyze_sentiment(message_text)
             sentiment_score = 1.0 if sentiment['label'] == 'POSITIVE' else -1.0 if sentiment['label'] == 'NEGATIVE' else 0.0
             lead.sentiment_score = sentiment_score
 
-            # 2. Intent classification (lightweight)
             intent = simple_intent(message_text)
             lead.intent_label = intent
 
-            # 3. Get conversation messages for feature extraction
             msg_result = await session.execute(
                 select(Message).where(Message.conversation_id == conversation_id).order_by(Message.created_at)
             )
             conversation_messages = msg_result.scalars().all()
 
-            # 4. Extract features and compute conversion probability
             features = extract_features_for_lead(lead, conversation_messages)
             prob = predict_conversion_probability(features)
             lead.conversion_probability = prob
             lead.lead_score = int(prob * 100)
             lead.last_scored_at = datetime.utcnow()
 
-            # 5. Compute embedding for duplicate detection (if not exists)
             if lead.embedding is None:
                 text_for_embedding = f"{lead.customer_name or ''} {lead.email or ''} {lead.customer_phone or ''}"
-                lead.embedding = get_embedding(text_for_embedding).tolist()  # store as list
+                lead.embedding = get_embedding(text_for_embedding).tolist()
 
             await session.commit()
 
-            # 6. WebSocket alert for high-score leads (probability > 0.8)
             if prob > 0.8:
                 send_alert(lead.id, lead.customer_name or lead.customer_phone, prob)
 
             logger.info(f"ML processing completed for lead {lead_id}: score={lead.lead_score}, intent={intent}")
 
-            # 7. (Optional) Check for duplicates if lead is new
-            if lead.duplicate_checked is False:  # add column if needed
-                # Fetch all existing embeddings (could be heavy – implement carefully)
-                # For now, skip; you can implement later via separate task.
-                pass
-
     except Exception as e:
         logger.error(f"ML background processing failed for lead {lead_id}: {e}", exc_info=True)
 
-# ---------- Helper: Get or create Lead from conversation ----------
+
 async def get_or_create_lead(session: AsyncSession, conversation: Conversation, phone_number: str) -> Lead:
-    # First try by conversation_id
     result = await session.execute(
         select(Lead).where(Lead.conversation_id == conversation.id)
     )
     lead = result.scalar_one_or_none()
-    
-    # If not found, try by customer_phone AND organization_id
     if not lead:
         result = await session.execute(
             select(Lead)
             .where(Lead.customer_phone == phone_number)
-            .where(Lead.organization_id == conversation.organization_id)  # ← ADD THIS
+            .where(Lead.organization_id == conversation.organization_id)
             .order_by(Lead.created_at.desc())
             .limit(1)
         )
         lead = result.scalar_one_or_none()
-    
-    # If still no lead, create a new one
     if not lead:
         lead = Lead(
             id=uuid.uuid4(),
-            organization_id=conversation.organization_id,  # ← SET THIS
+            organization_id=conversation.organization_id,
             conversation_id=conversation.id,
             customer_phone=phone_number,
-            customer_name=None,
-            email=None,
+            status="new",
             lead_score=0,
             conversion_probability=0.0,
-            status="new",
-            sentiment_score=0.0,
-            intent_label="general",
             created_at=datetime.utcnow()
         )
         session.add(lead)
         await session.flush()
     else:
-        # Update conversation link if needed
         if lead.conversation_id != conversation.id:
             lead.conversation_id = conversation.id
             session.add(lead)
-    
     return lead
 
-# ---------- Webhook Endpoints ----------
+
 @router.get("")
 async def verify_webhook(
     hub_mode: str = None,
@@ -200,6 +170,7 @@ async def verify_webhook(
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
         return hub_challenge
     raise HTTPException(status_code=403, detail="Verification failed")
+
 
 @router.post("")
 async def receive_webhook(
@@ -220,19 +191,33 @@ async def receive_webhook(
         changes = entry["changes"][0]
         value = changes["value"]
 
-        # ---------- Handle Status Updates (unchanged) ----------
+        # ---------- Handle Status Updates (UPDATES existing message) ----------
         if "statuses" in value:
-            # ... keep existing status handling code ...
-            pass
+            statuses = value["statuses"]
+            for status_data in statuses:
+                wamid = status_data.get("id")
+                status = status_data.get("status")  # "sent", "delivered", "read", "failed"
+                if not wamid:
+                    logger.warning("Status update missing message ID")
+                    continue
+
+                stmt = update(Message).where(Message.whatsapp_message_id == wamid).values(status=status)
+                result = await db.execute(stmt)
+                await db.commit()
+
+                if result.rowcount == 0:
+                    logger.warning(f"No message found for status update: wamid={wamid}, status={status}")
+                else:
+                    logger.info(f"Updated message {wamid} status to {status}")
 
         # ---------- Handle Incoming Messages ----------
         if "messages" in value:
             msg_data = value["messages"][0]
             from_number = msg_data["from"]
             timestamp = int(msg_data["timestamp"])
+            wamid = msg_data.get("id")
             business_phone_number = value["metadata"]["display_phone_number"]
 
-            # Extract message content
             msg_type = msg_data.get("type")
             caption = ""
             media_whatsapp_id = None
@@ -296,9 +281,11 @@ async def receive_webhook(
                 if conv.reply_mode is None:
                     conv.reply_mode = 'ai'
 
-            # Create message record
+            # Create message record with upsert (handles webhook retries)
             new_message_id = uuid.uuid4()
-            new_message = Message(
+            sort_ts = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+
+            insert_stmt = pg_insert(Message).values(
                 id=new_message_id,
                 conversation_id=conv.id,
                 organization_id=org_id,
@@ -311,27 +298,40 @@ async def receive_webhook(
                 media_url=f"/api/conversations/media/{new_message_id}" if media_whatsapp_id else None,
                 is_ai_generated=False,
                 status="delivered",
-                created_at=datetime.utcnow()
+                created_at=datetime.now(timezone.utc),
+                whatsapp_message_id=wamid,
+                whatsapp_timestamp=timestamp,
+                sort_timestamp=sort_ts
             )
-            db.add(new_message)
 
-            # Update conversation stats
-            if new_message.direction == "inbound":
-                naive_utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
-                await db.execute(
-                    update(Conversation)
-                    .where(Conversation.id == conv.id)
-                    .values(
-                        unread_count=Conversation.unread_count + 1,
-                        last_customer_message_at=naive_utc_now
-                    )
+            upsert_stmt = insert_stmt.on_conflict_do_update(
+                index_elements=['whatsapp_message_id'],
+                set_={
+                    'status': 'delivered',
+                    'content': content,
+                    'message_type': message_type,
+                    'media_whatsapp_id': media_whatsapp_id,
+                    'media_file_name': media_file_name,
+                    'media_content_type': media_content_type
+                }
+            )
+            
+            await db.execute(upsert_stmt)
+
+            # Update conversation stats (since direction is inbound, we increment unread count)
+            naive_utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+            await db.execute(
+                update(Conversation)
+                .where(Conversation.id == conv.id)
+                .values(
+                    unread_count=Conversation.unread_count + 1,
+                    last_customer_message_at=naive_utc_now,
+                    last_message_at=datetime.now(timezone.utc)
                 )
-            conv.last_message_at = datetime.utcnow()
-            db.add(conv)
+            )
 
             # Create or link Lead
             lead = await get_or_create_lead(db, conv, from_number)
-
             await db.commit()
 
             # Schedule media download if needed
@@ -346,7 +346,7 @@ async def receive_webhook(
                     media_content_type or "application/octet-stream"
                 )
 
-            # Schedule ML processing (sentiment, scoring, etc.) for this lead
+            # Schedule ML processing
             background_tasks.add_task(
                 process_lead_ml_background,
                 lead.id,
@@ -354,12 +354,14 @@ async def receive_webhook(
                 content
             )
 
-            # ---------- Rule/AI reply handling (unchanged) ----------
+            # ---------- Rule/AI reply handling ----------
             if conv.reply_mode == 'rule':
                 reply, _ = await get_rule_reply(str(org_id), str(conv.id), content)
                 if reply:
+                    # Send reply and save outbound message with proper timestamps
                     success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=str(org_id))
                     if success:
+                        now_utc = datetime.now(timezone.utc)
                         out_msg = Message(
                             id=uuid.uuid4(),
                             conversation_id=conv.id,
@@ -367,11 +369,17 @@ async def receive_webhook(
                             content=reply,
                             is_ai_generated=False,
                             status="sent",
-                            created_at=datetime.utcnow(),
-                            whatsapp_message_id=wamid
+                            created_at=now_utc,
+                            whatsapp_message_id=wamid,
+                            whatsapp_timestamp=int(now_utc.timestamp()),
+                            sort_timestamp=now_utc
                         )
                         db.add(out_msg)
-                        conv.last_message_at = datetime.utcnow()
+                        await db.execute(
+                            update(Conversation)
+                            .where(Conversation.id == conv.id)
+                            .values(last_message_at=now_utc)
+                        )
                         await db.commit()
                         logger.info(f"Rule-based reply sent to {from_number}")
                         return {"status": "ok"}
@@ -384,16 +392,14 @@ async def receive_webhook(
                 logger.info(f"Conversation {conv.id} in human mode – skipping AI reply")
                 return {"status": "ok"}
             else:
-                background_tasks.add_task(
-                    process_incoming_message,
-                    {
-                        "from_number": from_number,
-                        "text": content,
-                        "timestamp": timestamp,
-                        "org_id": str(org_id),
-                        "conversation_id": str(conv.id)
-                    }
-                )
+                # Use Celery or BackgroundTasks for AI processing
+                background_tasks.add_task(process_incoming_message, {
+                    "from_number": from_number,
+                    "text": content,
+                    "timestamp": timestamp,
+                    "org_id": str(org_id),
+                    "conversation_id": str(conv.id)
+                })
                 logger.info(f"Scheduled AI processing for message from {from_number}")
 
     except Exception as e:

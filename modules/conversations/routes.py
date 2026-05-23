@@ -1,4 +1,3 @@
-# modules/conversations/routes.py
 import asyncio
 import io
 import httpx
@@ -7,6 +6,7 @@ from typing import List, Optional, Dict, Any
 from uuid import UUID
 from pydantic import BaseModel
 from pathlib import Path
+from datetime import datetime, timezone   # <-- CRITICAL: added datetime and timezone
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Body
 from fastapi.responses import StreamingResponse, FileResponse
@@ -174,7 +174,7 @@ async def send_message(
         logger.error(f"Error sending message: {e}")
         raise HTTPException(500, "Internal server error")
 
-# ==================== MEDIA UPLOAD ENDPOINT ====================
+# ==================== MEDIA UPLOAD ENDPOINT (FIXED) ====================
 @router.post("/{conv_id}/media", response_model=None)
 async def upload_media(
     conv_id: UUID,
@@ -197,6 +197,7 @@ async def upload_media(
     if not mime_type:
         raise HTTPException(400, "Content-Type missing")
 
+    # Determine media category
     supported_mime_types = {
         "image": ["image/jpeg", "image/png", "image/webp"],
         "video": ["video/mp4", "video/3gpp"],
@@ -222,6 +223,7 @@ async def upload_media(
     if caption and media_category == "audio":
         raise HTTPException(400, "Captions are not allowed for audio messages")
 
+    # Verify conversation
     conv_result = await db.execute(
         select(Conversation).where(
             Conversation.id == conv_id,
@@ -236,8 +238,37 @@ async def upload_media(
     if not whatsapp_config:
         raise HTTPException(400, "WhatsApp configuration missing for this organization")
 
+    # ------------------------------------------------------------------
+    # 1. CREATE OPTIMISTIC MESSAGE (sending) WITH TIMESTAMPS
+    # ------------------------------------------------------------------
+    now_utc = datetime.now(timezone.utc)
+    message_id = uuid.uuid4()
+    temp_message = Message(
+        id=message_id,
+        conversation_id=conv_id,
+        direction="outbound",
+        message_type=media_category,
+        content=caption or "",
+        status="sending",
+        created_at=now_utc,
+        sort_timestamp=now_utc,
+        whatsapp_timestamp=int(now_utc.timestamp()),
+        organization_id=UUID(org_id),
+        is_ai_generated=False,
+        human_agent_id=UUID(user_id),
+        media_file_name=file.filename,
+        media_content_type=mime_type,
+        media_file_size=file.size,
+    )
+    db.add(temp_message)
+    await db.flush()
+
+    # Read file bytes
     file_bytes = await file.read()
 
+    # ------------------------------------------------------------------
+    # 2. UPLOAD MEDIA TO WHATSAPP
+    # ------------------------------------------------------------------
     whatsapp_service = WhatsAppService(
         whatsapp_config['access_token'],
         whatsapp_config['phone_number_id']
@@ -247,8 +278,13 @@ async def upload_media(
         logger.info(f"Media uploaded successfully, media_id: {media_id}")
     except Exception as e:
         logger.error(f"WhatsApp upload failed: {e}")
+        temp_message.status = "failed"
+        await db.commit()
         raise HTTPException(502, f"WhatsApp upload error: {str(e)}")
 
+    # ------------------------------------------------------------------
+    # 3. SEND MEDIA MESSAGE
+    # ------------------------------------------------------------------
     try:
         success, wamid = await whatsapp_service.send_media_message(
             to_number=conv.customer_phone_number,
@@ -257,16 +293,26 @@ async def upload_media(
             caption=caption
         )
         if not success:
+            temp_message.status = "failed"
+            await db.commit()
             raise HTTPException(502, "Failed to send media message")
         logger.info(f"Media message sent, wamid: {wamid}")
     except Exception as e:
         logger.error(f"Failed to send media message: {e}")
+        temp_message.status = "failed"
+        await db.commit()
         raise HTTPException(502, f"Failed to send media: {str(e)}")
 
-    message_id = uuid.uuid4()
+    # ------------------------------------------------------------------
+    # 4. UPDATE MESSAGE WITH WHATSAPP IDs
+    # ------------------------------------------------------------------
+    temp_message.status = "sent"
+    temp_message.whatsapp_message_id = wamid
+    temp_message.media_whatsapp_id = media_id
+
+    # Try immediate download (optional)
     local_path = None
     local_url = None
-
     try:
         local_path, local_url = await download_and_save_media(
             media_id=media_id,
@@ -276,42 +322,24 @@ async def upload_media(
             message_id=message_id
         )
         logger.info(f"Media downloaded and saved to {local_path}")
+        temp_message.local_media_path = local_path
+        temp_message.media_url = local_url
     except Exception as e:
         logger.error(f"Immediate media download failed, will rely on webhook: {e}")
-        local_url = None
 
-    message = Message(
-        id=message_id,
-        conversation_id=conv_id,
-        direction="outbound",
-        message_type=media_category,
-        content=caption or "",
-        media_whatsapp_id=media_id,
-        media_content_type=mime_type,
-        media_file_name=file.filename,
-        media_file_size=file.size,
-        is_ai_generated=False,
-        human_agent_id=UUID(user_id),
-        status="sent",
-        whatsapp_message_id=wamid,
-        media_url=local_url,
-        local_media_path=local_path if local_url else None,
-        organization_id=UUID(org_id)
-    )
-    db.add(message)
     await db.commit()
-    await db.refresh(message)
+    await db.refresh(temp_message)
 
-    logger.info(f"Media uploaded, sent, and saved: message_id={message.id}, media_id={media_id}")
+    logger.info(f"Media uploaded, sent, and saved: message_id={temp_message.id}, media_id={media_id}")
     return {
-        "message_id": str(message.id),
+        "message_id": str(temp_message.id),
         "media_id": media_id,
         "whatsapp_message_id": wamid,
         "status": "sent",
         "media_url": local_url
     }
 
-# ==================== MEDIA FETCH ENDPOINT ====================
+# ---------- Media Fetch Endpoint ----------
 @router.get("/{conv_id}/media/{message_id}", response_model=None)
 async def fetch_message_media(
     conv_id: UUID,
@@ -452,6 +480,7 @@ async def list_agents(
     except Exception as e:
         logger.error(f"Error listing agents: {e}")
         raise HTTPException(500, "Internal server error")
+
 @router.post("/{conv_id}/mode", response_model=None)
 async def toggle_mode(
     conv_id: UUID,
@@ -597,7 +626,7 @@ async def get_conversation_tags(
         logger.error(f"Error getting conversation tags: {e}")
         raise HTTPException(500, "Internal server error")
 
-# ---------- NEW ENDPOINTS for DoubleTick UI ----------
+# ---------- Additional endpoints (counts, mark-read, etc.) ----------
 class MetadataUpdate(BaseModel):
     metadata: Dict[str, Any]
 
@@ -629,7 +658,6 @@ async def mark_conversation_read(
     await service.mark_conversation_read(conv_id, UUID(org_id))
     return {"status": "read"}
 
-# Also ensure the PATCH /custom-fields and other new endpoints are added (as provided earlier)
 @router.get("/{conv_id}/assignment-history", response_model=None)
 async def get_assignment_history(
     conv_id: UUID,

@@ -1,9 +1,10 @@
-import asyncio
 from fastapi import WebSocket
+from typing import List
+import asyncio
 
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        self.active_connections: List[WebSocket] = []
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -18,6 +19,13 @@ class ConnectionManager:
                 await connection.send_json(message)
             except:
                 pass
+
+    def broadcast_message_update(self, message_data: dict):
+        """Broadcast message update (creation or status change) to all connected clients."""
+        asyncio.create_task(self.broadcast({
+            "type": "message_event",
+            **message_data
+        }))
 
 manager = ConnectionManager()
 

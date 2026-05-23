@@ -137,9 +137,16 @@ class Message(Base):
     human_agent_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     status = Column(String(20), default="sent")
-    whatsapp_message_id = Column(String(255))
+    whatsapp_message_id = Column(String(255), unique=True, nullable=True)
     local_media_path = Column(String(500), nullable=True)
     organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True)
+    # New fields for proper message ordering (source of truth: Meta's timestamp)
+    whatsapp_timestamp = Column(Integer, nullable=True)  # Unix seconds from Meta's webhook
+    sort_timestamp = Column(DateTime(timezone=True), nullable=True)  # Derived from whatsapp_timestamp
+    __table_args__ = (
+        Index("ix_messages_sort_timestamp", "sort_timestamp"),
+        Index("ix_messages_conversation_sort", "conversation_id", "sort_timestamp"),
+    )
 
 
 class LeadSchema(Base):
@@ -450,3 +457,14 @@ class LeadNurturingLog(Base):
     status = Column(String(20), default="sent")
     error_message = Column(Text)
     lead = relationship("Lead", back_populates="nurturing_logs")
+
+class ConversationMemory(Base):
+    __tablename__ = "conversation_memories"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"))
+    facts = Column(JSON, default={})          # store extracted lead data, preferences, etc.
+    last_summary = Column(Text)               # short summary of last conversation
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    # Relationships
+    conversation = relationship("Conversation", backref="memories")

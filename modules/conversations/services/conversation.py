@@ -142,6 +142,7 @@ class ConversationService:
                 "sender_type": msg.direction,
                 "direction": msg.direction, 
                 "created_at": msg.created_at.isoformat(),
+                "sort_timestamp": msg.sort_timestamp.isoformat() if msg.sort_timestamp else msg.created_at.isoformat(),
                 "status": msg.status,
                 "message_type": msg.message_type,
                 "media_url": msg.media_url,
@@ -159,6 +160,9 @@ class ConversationService:
             raise ValueError("Conversation not found or access denied")
         if user_role != 'org_admin' and conv.assigned_agent_id != user_id:
             raise PermissionError("You are not assigned to this conversation")
+        
+        # Create message with "sending" status and proper sort_timestamp
+        sort_ts = datetime.now(timezone.utc)
         message = Message(
             conversation_id=conv_id,
             content=text,
@@ -166,22 +170,28 @@ class ConversationService:
             message_type="text",
             is_ai_generated=False,
             human_agent_id=user_id,
-            status="sent",
-            created_at=datetime.now(timezone.utc)
+            status="sending",  # START as sending (before API call)
+            created_at=datetime.now(timezone.utc),
+            sort_timestamp=sort_ts,  # Use current time as sort key
+            whatsapp_timestamp=int(sort_ts.timestamp())
         )
         message = await self.msg_repo.create(message)
         conv.last_message_at = datetime.utcnow()
         conv.unread_count = 0
         await self.session.commit()
+        
+        # Send async and update message when response arrives
         whatsapp_config = await get_whatsapp_config(str(org_id))
         if whatsapp_config:
             service = WhatsAppService(whatsapp_config['access_token'], whatsapp_config['phone_number_id'])
             asyncio.create_task(self._send_whatsapp_text(conv.customer_phone_number, text, service, message.id))
+        
         return {
             "id": str(message.id),
             "text": message.content,
             "sender_type": message.direction,
             "created_at": message.created_at.isoformat(),
+            "sort_timestamp": message.sort_timestamp.isoformat() if message.sort_timestamp else None,
             "status": message.status,
             "message_type": message.message_type,
             "whatsapp_message_id": message.whatsapp_message_id,
@@ -198,6 +208,15 @@ class ConversationService:
                 else:
                     message.status = "failed"
                 await self.session.commit()
+                # Broadcast message update via WebSocket
+                from modules.websocket import manager
+                manager.broadcast_message_update({
+                    "type": "message_updated",
+                    "conversation_id": str(message.conversation_id),
+                    "message_id": str(message.id),
+                    "status": message.status,
+                    "whatsapp_message_id": wamid
+                })
         except Exception as e:
             logger.error(f"Error sending WhatsApp text: {e}")
 

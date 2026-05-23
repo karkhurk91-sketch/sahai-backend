@@ -7,6 +7,7 @@ from sqlalchemy import text
 from modules.common.database import sync_engine
 from modules.common.logger import get_logger
 
+
 logger = get_logger(__name__)
 
 _client_cache = {}
@@ -17,7 +18,8 @@ _embedding_model = None
 def get_embedding_model():
     global _embedding_model
     if _embedding_model is None:
-        _embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")  # 🔥 lighter model
+        # BAAI/bge-small-en-v1.5 produces 384-dim vectors (lightweight)
+        _embedding_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
     return _embedding_model
 
 
@@ -25,15 +27,13 @@ def get_embedding_model():
 def cosine_similarity(a, b):
     a = np.array(a)
     b = np.array(b)
-
     denom = (np.linalg.norm(a) * np.linalg.norm(b))
     if denom == 0:
         return 0.0
-
     return float(np.dot(a, b) / denom)
 
 
-# ✅ Chroma client
+# ✅ Chroma client (per organization)
 def get_chroma_client(org_id: str, persist_dir: str = "./chroma_db"):
     if org_id not in _client_cache:
         store_path = os.path.join(persist_dir, str(org_id))
@@ -43,15 +43,34 @@ def get_chroma_client(org_id: str, persist_dir: str = "./chroma_db"):
 
 
 # ✅ Smart chunking (prevents huge chunks)
-def split_text(content, chunk_size=500):
+def split_text(content: str, chunk_size: int = 500) -> list:
     words = content.split()
     chunks = []
-
     for i in range(0, len(words), chunk_size):
         chunk = " ".join(words[i:i + chunk_size])
         chunks.append(chunk)
-
     return chunks
+
+
+# ✅ Get or create collection (idempotent)
+def get_or_create_collection(org_id: str):
+    client = get_chroma_client(org_id)
+    collection_name = f"knowledge_{org_id}"
+    try:
+        collection = client.get_collection(collection_name)
+        return collection
+    except Exception:
+        # Collection does not exist – create it with embedding function
+        model = get_embedding_model()
+        class EmbeddingFunction:
+            def __call__(self, texts):
+                return list(model.embed(texts))
+        collection = client.create_collection(
+            name=collection_name,
+            embedding_function=EmbeddingFunction(),
+            metadata={"hnsw:space": "cosine"}
+        )
+        return collection
 
 
 # ✅ Index document
@@ -63,33 +82,30 @@ def index_document(doc_id: uuid.UUID, org_id: str, file_path: str, file_type: st
             content = f.read()
 
         chunks = split_text(content)
-
         if not chunks:
             chunks = [content[:1000]]
 
         model = get_embedding_model()
+        # Precompute embeddings for all chunks
         embeddings = list(model.embed(chunks))
 
-        client = get_chroma_client(org_id)
-
-        collection = client.get_or_create_collection(
-            name="documents",
-            metadata={"hnsw:space": "cosine"}
-        )
+        collection = get_or_create_collection(org_id)
 
         ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
+        metadatas = [
+            {"doc_id": str(doc_id), "org_id": str(org_id), "chunk": i}
+            for i in range(len(chunks))
+        ]
 
+        # Add to ChromaDB
         collection.add(
+            ids=ids,
             documents=chunks,
             embeddings=[e.tolist() for e in embeddings],
-            ids=ids,
-            metadatas=[
-                {"doc_id": str(doc_id), "org_id": str(org_id), "chunk": i}
-                for i in range(len(chunks))
-            ]
+            metadatas=metadatas
         )
 
-        # Save full content for keyword search
+        # Save full content for keyword search (PostgreSQL)
         with sync_engine.connect() as conn:
             conn.execute(
                 text("UPDATE knowledge_documents SET content = :content WHERE id = :doc_id"),
@@ -100,34 +116,31 @@ def index_document(doc_id: uuid.UUID, org_id: str, file_path: str, file_type: st
         logger.info(f"Indexed {len(chunks)} chunks for doc {doc_id}")
 
     except Exception as e:
-        logger.error(f"Indexing failed: {e}")
+        logger.error(f"Indexing failed: {e}", exc_info=True)
 
 
-# ✅ Hybrid search
-def hybrid_search(org_id: str, query: str, k: int = 10):
+# ✅ Hybrid search (vector + keyword)
+def hybrid_search(org_id: str, query: str, k: int = 10) -> list:
     chunks = []
 
     # 🔹 Vector search
     try:
         model = get_embedding_model()
         query_embedding = list(model.embed([query]))[0].tolist()
+        collection = get_or_create_collection(org_id)
 
-        client = get_chroma_client(org_id)
-
-        try:
-            collection = client.get_collection("documents")
-        except Exception:
-            return []
-
-        results = collection.query(query_embeddings=[query_embedding], n_results=k)
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=k
+        )
 
         if results and results.get("documents"):
             chunks.extend(results["documents"][0])
 
     except Exception as e:
-        logger.error(f"Vector search failed: {e}")
+        logger.error(f"Vector search failed: {e}", exc_info=True)
 
-    # 🔹 Keyword search
+    # 🔹 Keyword search (PostgreSQL full-text)
     try:
         with sync_engine.connect() as conn:
             keyword_results = conn.execute(
@@ -141,16 +154,13 @@ def hybrid_search(org_id: str, query: str, k: int = 10):
                 """),
                 {"org_id": org_id, "query": query, "k": k}
             ).fetchall()
-
             chunks.extend([row.content for row in keyword_results])
-
     except Exception as e:
-        logger.error(f"Keyword search failed: {e}")
+        logger.error(f"Keyword search failed: {e}", exc_info=True)
 
     # 🔹 Deduplicate
     seen = set()
     unique_chunks = []
-
     for chunk in chunks:
         if chunk not in seen:
             seen.add(chunk)
@@ -159,23 +169,16 @@ def hybrid_search(org_id: str, query: str, k: int = 10):
     return unique_chunks[:k]
 
 
-# ✅ Final search (rerank)
+# ✅ Final search with reranking
 def search_knowledge(org_id: str, query: str, k: int = 3) -> list:
     candidates = hybrid_search(org_id, query, k=k * 3)
-
     if not candidates:
         return []
 
     model = get_embedding_model()
-
     query_embedding = list(model.embed([query]))[0]
     doc_embeddings = list(model.embed(candidates))
 
-    scores = [
-        cosine_similarity(query_embedding, emb)
-        for emb in doc_embeddings
-    ]
-
+    scores = [cosine_similarity(query_embedding, emb) for emb in doc_embeddings]
     scored = sorted(zip(candidates, scores), key=lambda x: x[1], reverse=True)
-
     return [doc for doc, _ in scored[:k]]

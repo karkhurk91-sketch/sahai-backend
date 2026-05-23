@@ -2,13 +2,15 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_
 from modules.common.database import get_db
-from modules.common.models import Conversation, Lead, LeadSchema, Organization
+from modules.common.models import User, Conversation, Lead, LeadSchema, Organization
 from modules.auth.jwt import get_current_user
 from modules.common.masking import MaskingConfig, apply_masking_to_dict
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 from datetime import datetime
+from modules.auth.routes import get_current_user
+import uuid
 
 router = APIRouter(prefix="/api/leads", tags=["Leads"])
 
@@ -246,3 +248,17 @@ async def update_lead(
     lead.status = update.status
     await db.commit()
     return {"status": "updated"}
+
+@router.get("/by-conversation/{conversation_id}")
+async def get_lead_by_conversation(
+    conversation_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    result = await db.execute(
+        select(Lead).where(Lead.conversation_id == uuid.UUID(conversation_id))
+    )
+    lead = result.scalar_one_or_none()
+    if not lead:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return lead
