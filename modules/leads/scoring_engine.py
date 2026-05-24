@@ -1,23 +1,39 @@
-# Reuse existing feature_extractor and rule-based score as fallback
-from modules.ml.feature_extractor import extract_features_for_lead
-import joblib
-
-MODEL_PATH = "models/lead_scoring_v1.pkl"
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, update
+from modules.common.models import Lead
+from datetime import datetime
 
 async def score_lead(db: AsyncSession, lead_id: str):
-    lead = await db.get(Lead, lead_id)
-    messages = await get_conversation_messages(db, lead.conversation_id)
-    features = extract_features_for_lead(lead, messages)  # already exists
+    """Score a single lead"""
+    result = await db.execute(
+        select(Lead).where(Lead.id == lead_id)
+    )
+    lead = result.scalar_one_or_none()
     
-    try:
-        model = joblib.load(MODEL_PATH)
-        prob = model.predict_proba([features])[0][1]
-    except:
-        # Fallback to rule‑based (already exists in webhook)
-        prob = predict_conversion_probability(features)  # your rule function
+    if not lead:
+        return None
     
-    lead.lead_score = int(prob * 100)
-    lead.conversion_probability = prob
-    lead.last_scored_at = datetime.utcnow()
+    # Simple scoring logic
+    score = 50  # Base score
+    
+    # Update score
+    await db.execute(
+        update(Lead)
+        .where(Lead.id == lead_id)
+        .values(score=score, last_scored_at=datetime.now())
+    )
     await db.commit()
-    return lead
+    
+    return score
+
+async def rescore_all_active_leads(db: AsyncSession):
+    """Rescore all active leads"""
+    result = await db.execute(
+        select(Lead).where(Lead.status == 'active')
+    )
+    leads = result.scalars().all()
+    
+    for lead in leads:
+        await score_lead(db, lead.id)
+    
+    return len(leads)

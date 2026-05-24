@@ -309,6 +309,7 @@ class Campaign(Base):
     whatsapp_link = Column(Text)
     status = Column(String(20), default="draft")
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    post_type = Column(String(20), default='ai', nullable=False)
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
 class CampaignCreative(Base):
@@ -320,6 +321,7 @@ class CampaignCreative(Base):
     is_selected = Column(Boolean, default=False)
     media_url = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    video_url = Column(String(500), nullable=True) 
 
 class CampaignMeta(Base):
     __tablename__ = "campaign_meta"

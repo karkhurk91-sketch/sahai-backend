@@ -8,19 +8,19 @@ from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete
 from groq import Groq
 
 from modules.common.database import get_db
-from modules.common.models import Campaign, CampaignCreative, CampaignMeta, Organization, OrganizationChannel
+from modules.common.models import Campaign, CampaignCreative, CampaignMeta, Organization, OrganizationChannel, SocialAccount,SocialAdCampaign
 from modules.auth.jwt import get_current_user
 from modules.common.logger import get_logger
 from modules.common.config import GROQ_API_KEY, API_BASE_URL
 from modules.social.factory import SocialFactory
-from modules.common.models import SocialAccount, SocialAdCampaign
+
 
 
 logger = get_logger(__name__)
@@ -48,6 +48,7 @@ class CampaignCreate(BaseModel):
     price: str
     location: str
     description: Optional[str] = None
+    is_ai: bool = True  # NEW: indicates if created via AI flow
 
 class CampaignResponse(BaseModel):
     id: UUID
@@ -55,7 +56,9 @@ class CampaignResponse(BaseModel):
     product_name: str
     status: str
     created_at: datetime
-    class Config: from_attributes = True
+    post_type: str  # 'ai' or 'manual'
+    class Config:
+        from_attributes = True
 
 class CreativeResponse(BaseModel):
     id: UUID
@@ -63,7 +66,8 @@ class CreativeResponse(BaseModel):
     content: str
     is_selected: bool
     media_url: Optional[str] = None
-    class Config: from_attributes = True
+    class Config:
+        from_attributes = True
 
 class SelectCreativeRequest(BaseModel):
     creative_id: UUID
@@ -95,6 +99,8 @@ class AdCampaignCreate(BaseModel):
     lead_form_questions: list
     story_spec: dict
     start_time: Optional[str] = None
+
+
 
 # ---------- Text caption generator ----------
 def _generate_captions_sync(product_name: str, price: str, location: str, description: str = "") -> list[str]:
@@ -136,7 +142,6 @@ Output one caption per line.
 
 # ---------- Image prompt generator ----------
 def _generate_media_prompt_sync(product_name: str, price: str, location: str, description: str, media_type: str = "image") -> str:
-    """Generate a prompt that creates an image optimized for lead conversion."""
     system_prompt = f"""
 You are an expert conversion copywriter and image prompt engineer for social media ads.
 Your task: create an image prompt for an ad that generates leads/sales for a product.
@@ -228,9 +233,78 @@ Do not include any extra text outside the JSON.
         logger.error(f"AI ad‑kit generation failed: {e}")
         return None
 
-# ---------- Endpoints ----------
+# ========== NEW: Manual creative endpoint (fixed) ==========
+@router.post("/{campaign_id}/manual-creative")
+async def create_manual_creative(
+    campaign_id: str,
+    title: str = Form(...),
+    text: str = Form(...),
+    image: Optional[UploadFile] = File(None),
+    video: Optional[UploadFile] = File(None),
+    tags: Optional[str] = Form(None),
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    # Verify campaign exists
+    stmt = select(Campaign).where(Campaign.id == UUID(campaign_id), Campaign.organization_id == current_user["org_id"])
+    campaign = (await db.execute(stmt)).scalar_one_or_none()
+    if not campaign:
+        raise HTTPException(404, "Campaign not found")
+
+    # Parse tags (JSON string)
+    import json
+    tags_list = json.loads(tags) if tags else []
+
+    # Save uploaded files
+    image_url = None
+    video_url = None
+    upload_dir = "uploads/campaign_creatives"
+    os.makedirs(upload_dir, exist_ok=True)
+
+    if image:
+        ext = os.path.splitext(image.filename)[1]
+        filename = f"manual_{campaign_id}_{uuid.uuid4()}{ext}"
+        filepath = os.path.join(upload_dir, filename)
+        content = await image.read()
+        with open(filepath, "wb") as f:
+            f.write(content)
+        image_url = f"{API_BASE_URL}/static/campaign_creatives/{filename}"
+
+    if video:
+        ext = os.path.splitext(video.filename)[1]
+        filename = f"manual_{campaign_id}_{uuid.uuid4()}{ext}"
+        filepath = os.path.join(upload_dir, filename)
+        content = await video.read()
+        with open(filepath, "wb") as f:
+            f.write(content)
+        video_url = f"{API_BASE_URL}/static/campaign_creatives/{filename}"
+
+    # Create creative record
+    creative = CampaignCreative(
+        id=uuid.uuid4(),
+        campaign_id=UUID(campaign_id),
+        type="manual",
+        content=text,
+        media_url=image_url,
+
+    )
+    # If CampaignCreative has a video_url column, set it
+    if hasattr(creative, 'video_url'):
+        creative.video_url = video_url
+
+    db.add(creative)
+    await db.commit()
+    await db.refresh(creative)
+
+    return {"creative": creative, "creative_id": creative.id}
+# ========== CREATE campaign (updated to set post_type) ==========
 @router.post("/", response_model=CampaignResponse)
-async def create_campaign(data: CampaignCreate, db: AsyncSession = Depends(get_db), current_user=Depends(get_current_user)):
+async def create_campaign(
+    data: CampaignCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    post_type = "ai" if data.is_ai else "manual"
     campaign = Campaign(
         id=uuid.uuid4(),
         organization_id=current_user["org_id"],
@@ -239,7 +313,8 @@ async def create_campaign(data: CampaignCreate, db: AsyncSession = Depends(get_d
         price=data.price,
         location=data.location,
         description=data.description,
-        status="draft"
+        status="draft",
+        post_type=post_type   # NEW field
     )
     db.add(campaign)
     await db.commit()
@@ -247,19 +322,37 @@ async def create_campaign(data: CampaignCreate, db: AsyncSession = Depends(get_d
     return campaign
 
 @router.get("/", response_model=List[CampaignResponse])
-async def list_campaigns(db: AsyncSession = Depends(get_db), current_user=Depends(get_current_user)):
+async def list_campaigns(
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
     stmt = select(Campaign).where(Campaign.organization_id == current_user["org_id"])
     result = await db.execute(stmt)
-    return result.scalars().all()
+    campaigns = result.scalars().all()
+    return campaigns
 
 @router.get("/{campaign_id}", response_model=CampaignResponse)
-async def get_campaign(campaign_id: UUID, db: AsyncSession = Depends(get_db), current_user=Depends(get_current_user)):
-    stmt = select(Campaign).where(Campaign.id == campaign_id, Campaign.organization_id == current_user["org_id"])
+async def get_campaign(
+    campaign_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user=Depends(get_current_user)
+):
+    stmt = select(Campaign).where(
+        Campaign.id == campaign_id,
+        Campaign.organization_id == current_user["org_id"]
+    )
     campaign = (await db.execute(stmt)).scalar_one_or_none()
     if not campaign:
         raise HTTPException(404, "Campaign not found")
     return campaign
 
+# ... (all other existing endpoints unchanged: generate-content, creatives, select-creative, whatsapp-link, ad-kit, post-to-facebook, delete, etc.)
+# I will keep them as they were, but ensure they are present.
+
+# For brevity, I will include the rest of the endpoints from your original file.
+# Since the user provided the full file, I will just paste the remaining code below unchanged.
+
+# ---------- (remaining code from original file) ----------
 @router.post("/{campaign_id}/generate-content")
 async def generate_ai_content(
     campaign_id: UUID,
