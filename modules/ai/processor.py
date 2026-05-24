@@ -1,13 +1,15 @@
 import uuid
 import asyncio
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timedelta, date, time, timezone  # Added timezone
 from sqlalchemy import text, select
+from modules.ai.memory_manager import MemoryManager
+from modules.ai.booking_helper import save_booking_generic
 from modules.ai.agent import get_agent_for_user_compat
 from modules.ai.lead_capture import create_lead
 from modules.ai.lead_extractor import extract_lead_from_conversation
-from modules.ai.memory_manager import MemoryManager
 from modules.common.database import sync_engine, AsyncSessionLocal
-from modules.common.models import Conversation, Message, LeadSchema
+from modules.common.models import Conversation, Message, LeadSchema, Lead
 from modules.common.logger import get_logger
 from modules.leads.assignment_engine import auto_assign_lead, determine_lead_intelligence
 from modules.message.sender import send_whatsapp_text, send_whatsapp_template
@@ -84,6 +86,9 @@ async def _process_and_reply(
     org_uuid = uuid.UUID(org_id) if isinstance(org_id, str) else org_id
     conv_uuid = uuid.UUID(conversation_id) if isinstance(conversation_id, str) else conversation_id
 
+    # Initialize lead_id for later use in booking
+    lead_id = None
+
     # ----- Load AI memory (long‑term and short‑term) -----
     try:
         context = await memory_manager.get_context(str(conv_uuid))
@@ -94,7 +99,6 @@ async def _process_and_reply(
 
     # ----- Get AI agent (industry‑aware) -----
     agent = get_agent_for_user_compat(customer_phone, org_id)
-    # Optionally, you can inject context into agent's prompt here (not implemented in this version)
     ai_response = agent.predict(customer_message)
     logger.info(f"AI response (first 200 chars): {ai_response[:200]}")
 
@@ -185,9 +189,10 @@ async def _process_and_reply(
 
     logger.info(f"Reply sent to {customer_phone}")
 
-    # ----- Store AI message in DB -----
+    # ----- Store AI message in DB (with required timestamps) -----
     async with AsyncSessionLocal() as db:
         try:
+            now_utc = datetime.now(timezone.utc)  # timezone-aware
             ai_msg = Message(
                 id=uuid.uuid4(),
                 conversation_id=conv_uuid,
@@ -196,8 +201,10 @@ async def _process_and_reply(
                 content=ai_response,
                 is_ai_generated=True,
                 status="sent",
-                created_at=datetime.utcnow(),
-                whatsapp_message_id=wamid
+                created_at=now_utc,
+                whatsapp_message_id=wamid,
+                whatsapp_timestamp=int(now_utc.timestamp()),
+                sort_timestamp=now_utc
             )
             db.add(ai_msg)
             await db.execute(
@@ -211,6 +218,7 @@ async def _process_and_reply(
             await db.rollback()
 
     # ----- Lead creation / update -----
+    final_lead_data = {}  # define outside for booking block
     if is_lead:
         try:
             try:
@@ -259,6 +267,23 @@ async def _process_and_reply(
                 lead_stage=final_lead_data['lead_stage'],
                 rule_state=final_lead_data['rule_state']
             )
+            
+            # Fetch the created lead to get its ID for booking
+            try:
+                async with AsyncSessionLocal() as db:
+                    lead_result = await db.execute(
+                        select(Lead).where(
+                            Lead.organization_id == org_uuid,
+                            Lead.customer_phone == customer_phone
+                        ).order_by(Lead.created_at.desc()).limit(1)
+                    )
+                    fetched_lead = lead_result.scalars().first()
+                    if fetched_lead:
+                        lead_id = str(fetched_lead.id)
+                        logger.info(f"Fetched lead ID: {lead_id}")
+            except Exception as e:
+                logger.error(f"Failed to fetch lead after creation: {e}")
+            
             await auto_assign_lead(str(org_uuid), conversation_id, final_lead_data)
             logger.info(f"Lead created/updated for {customer_phone}")
 
@@ -275,6 +300,78 @@ async def _process_and_reply(
             logger.error(f"Lead creation failed: {e}", exc_info=True)
     else:
         logger.info(f"Lead NOT created. lead_data={lead_data}, extracted_lead_data={extracted_lead_data}, lead_capture_enabled={lead_capture_enabled}")
+
+    # ----- Booking Intent Detection (AFTER lead creation, using final_lead_data if available) -----
+    try:
+        # Only try booking if lead exists and keywords present
+        booking_keywords = ['book', 'appointment', 'reserve', 'table for', 'site visit', 'consultation', 'salon', 'spa', 'visit']
+        if is_lead and any(kw in customer_message.lower() for kw in booking_keywords):
+            # Extract booking date/time from conversation if possible
+            booking_date = None
+            booking_time = None
+
+            # Simple date parsing: look for "tomorrow"
+            if re.search(r'tomorrow|next day', customer_message.lower()):
+                booking_date = (datetime.now(timezone.utc) + timedelta(days=1)).date()
+            else:
+                booking_date = datetime.now(timezone.utc).date()
+
+            # Time pattern
+            time_match = re.search(r'(\d{1,2})\s*(?::(\d{2}))?\s*(am|pm)?', customer_message.lower())
+            if time_match:
+                try:
+                    hour = int(time_match.group(1))
+                    minute = int(time_match.group(2)) if time_match.group(2) else 0
+                    period = time_match.group(3) if time_match.group(3) else ''
+                    if period == 'pm' and hour != 12:
+                        hour += 12
+                    elif period == 'am' and hour == 12:
+                        hour = 0
+                    booking_time = time(hour=hour, minute=minute)
+                except:
+                    booking_time = time(hour=14, minute=0)  # default 2 PM
+            else:
+                booking_time = time(hour=14, minute=0)
+
+            # Prepare booking state
+            booking_state = {
+                "customer_phone": customer_phone,
+                "customer_name": conversation.customer_name if conversation else "",
+                "booking_date": booking_date,
+                "booking_time": booking_time,
+                "service": final_lead_data.get('service') or extracted_lead_data.get('service') or service or "site visit",
+                "notes": f"Interest: {final_lead_data.get('interest', '')[:100]}",
+                "lead_id": lead_id
+            }
+
+            booking = await save_booking_generic(
+                org_id=str(org_uuid),
+                state=booking_state,
+                industry="default"
+            )
+
+            if booking:
+                logger.info(f"✅ Booking created: ID={booking.id}, Date={booking.booking_date}, Time={booking.booking_time}")
+                # Broadcast WebSocket event
+                try:
+                    from modules.websocket import manager
+                    await manager.broadcast({
+                        "type": "booking_created",
+                        "booking": {
+                            "id": str(booking.id),
+                            "customer_name": booking.customer_name,
+                            "booking_date": booking.booking_date.isoformat() if booking.booking_date else None,
+                            "booking_time": str(booking.booking_time) if booking.booking_time else None,
+                            "service": booking.service,
+                            "status": booking.status
+                        }
+                    })
+                except Exception as ws_err:
+                    logger.warning(f"Failed to broadcast booking event: {ws_err}")
+            else:
+                logger.warning(f"Booking creation returned None for {customer_phone}")
+    except Exception as e:
+        logger.error(f"Booking intent detection failed: {e}", exc_info=True)
 
     # ----- Save conversation summary into memory (always) -----
     try:

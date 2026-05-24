@@ -253,12 +253,14 @@ class Booking(Base):
     __tablename__ = "bookings"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"))
+    lead_id = Column(UUID(as_uuid=True), ForeignKey("leads.id", ondelete="SET NULL"), nullable=True)
     customer_phone = Column(String(20), nullable=False)
     customer_name = Column(String(255))
     service = Column(String(100))
     booking_date = Column(Date)
     booking_time = Column(Time)
     status = Column(String(20), default="confirmed")
+    reminder_sent = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 
