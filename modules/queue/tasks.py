@@ -5,6 +5,8 @@ from modules.leads.nurturing_engine import run_due_nurturing_steps
 from modules.leads.scoring_engine import rescore_all_active_leads
 from modules.bookings.reminders import send_booking_reminders
 from modules.common.logger import get_logger
+from celery import shared_task
+from modules.message.sender import send_whatsapp_text
 
 logger = get_logger(__name__)
 
@@ -35,3 +37,20 @@ def send_booking_reminders_task():
         logger.info("Booking reminders sent")
     except Exception as e:
         logger.error(f"Booking reminders failed: {e}", exc_info=True)
+
+@shared_task(bind=True, max_retries=3)
+def send_follow_up_message(self, follow_up_id: str, lead_id: str):
+    from modules.common.database import AsyncSessionLocal
+    from modules.common.models import Lead, LeadNurturingStep
+    import asyncio
+
+    async def _send():
+        async with AsyncSessionLocal() as db:
+            step = await db.get(LeadNurturingStep, follow_up_id)
+            lead = await db.get(Lead, lead_id)
+            if step and lead and step.status == "scheduled":
+                success, _ = await send_whatsapp_text(lead.phone_number, step.message_template, str(lead.organization_id))
+                if success:
+                    step.status = "sent"
+                    await db.commit()
+    asyncio.run(_send())

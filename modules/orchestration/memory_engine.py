@@ -1,232 +1,65 @@
-"""
-Enterprise Memory Engine - Persistent conversation context
-Uses Redis (short-term) + PostgreSQL (long-term) with rolling summaries
-"""
-
-from typing import Dict, Any, Optional
-from datetime import datetime, timezone
+# modules/orchestration/memory_engine.py
 import json
-import redis
-from sqlalchemy import select
-from modules.common.database import AsyncSessionLocal
-from modules.common.logger import get_logger
-import uuid
+import logging
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta
+import redis.asyncio as redis
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_
+from modules.common.models import ConversationMemory
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
-
-class EnterpriseMemoryEngine:
-    """
-    Manages conversation memory with:
-    - Redis: Hot memory (last 50 messages, current session)
-    - PostgreSQL: Cold memory (summaries, completed fields, preferences)
-    - Rolling summaries: Compress old messages into summaries
-    """
-
-    def __init__(self, redis_client: Optional[redis.Redis] = None):
+class MemoryEngine:
+    """Manages short‑term (Redis) and long‑term (PostgreSQL) conversation memory."""
+    
+    def __init__(self, redis_client: redis.Redis, db_session: AsyncSession, ttl_seconds: int = 86400):
         self.redis = redis_client
-        self.short_term_ttl = 24 * 60 * 60  # 24 hours
-        self.summary_window = 20  # Summarize after 20 messages
+        self.db = db_session
+        self.ttl = ttl_seconds
 
-    def _short_term_key(self, conversation_id: str) -> str:
-        """Redis key for short-term memory."""
-        return f"memory:short:{conversation_id}"
+    async def add_message(self, conversation_id: str, role: str, content: str) -> None:
+        """Store a message in Redis list and trigger rolling summary every 20 messages."""
+        key = f"conv_mem:{conversation_id}:messages"
+        msg = json.dumps({"role": role, "content": content, "timestamp": datetime.utcnow().isoformat()})
+        await self.redis.rpush(key, msg)
+        await self.redis.expire(key, self.ttl)
+        
+        # Get message count
+        length = await self.redis.llen(key)
+        if length % 20 == 0:
+            await self._create_rolling_summary(conversation_id)
 
-    def _summary_key(self, conversation_id: str) -> str:
-        """Redis key for conversation summary."""
-        return f"memory:summary:{conversation_id}"
-
-    async def load_context(self, conversation_id: str) -> Dict[str, Any]:
-        """Load complete context for conversation."""
-        context = {
-            "short_term": {},
-            "long_term": {},
-            "summary": "",
-            "preferences": {},
-            "completed_fields": {},
-        }
-
-        # Load from Redis
-        if self.redis:
-            try:
-                # Short-term messages
-                messages_data = self.redis.get(self._short_term_key(conversation_id))
-                if messages_data:
-                    context["short_term"] = json.loads(messages_data)
-
-                # Summary
-                summary_data = self.redis.get(self._summary_key(conversation_id))
-                if summary_data:
-                    context["summary"] = summary_data.decode("utf-8")
-            except Exception as e:
-                logger.error(f"Failed to load from Redis: {e}")
-
-        # Load long-term from DB
+    async def get_recent_messages(self, conversation_id: str, limit: int = 10) -> List[Dict]:
+        """Return last N messages from Redis (fast) or fallback to DB."""
+        key = f"conv_mem:{conversation_id}:messages"
         try:
-            async with AsyncSessionLocal() as db:
-                from modules.common.models import ConversationMemory
-                result = await db.execute(
-                    select(ConversationMemory).where(
-                        ConversationMemory.conversation_id == uuid.UUID(conversation_id)
-                    ).order_by(ConversationMemory.created_at.desc()).limit(1)
-                )
-                memory = result.scalars().first()
-                if memory:
-                    context["long_term"] = memory.memory_data or {}
-                    context["preferences"] = memory.preferences or {}
-                    context["completed_fields"] = memory.completed_fields or {}
-        except Exception as e:
-            logger.debug(f"No long-term memory found: {e}")
-
-        return context
-
-    async def add_message_to_memory(
-        self,
-        conversation_id: str,
-        role: str,  # "user" or "assistant"
-        content: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Add a message to short-term memory."""
-        if not self.redis:
-            return
-
-        try:
-            # Get existing messages
-            messages_data = self.redis.get(self._short_term_key(conversation_id))
-            messages = json.loads(messages_data) if messages_data else []
-
-            # Add new message
-            messages.append({
-                "role": role,
-                "content": content,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "metadata": metadata or {},
-            })
-
-            # Keep only last 50 messages in Redis
-            messages = messages[-50:]
-
-            # Check if we need to summarize
-            if len(messages) >= self.summary_window:
-                await self._create_rolling_summary(conversation_id, messages)
-
-            # Save to Redis
-            self.redis.setex(
-                self._short_term_key(conversation_id),
-                self.short_term_ttl,
-                json.dumps(messages, default=str)
+            messages = await self.redis.lrange(key, -limit, -1)
+            return [json.loads(m) for m in messages]
+        except:
+            # Fallback to DB (conversation memory table)
+            result = await self.db.execute(
+                select(ConversationMemory)
+                .where(ConversationMemory.conversation_id == conversation_id)
+                .order_by(ConversationMemory.created_at.desc())
+                .limit(limit)
             )
-        except Exception as e:
-            logger.error(f"Failed to add message to memory: {e}")
+            memories = result.scalars().all()
+            return [{"role": "assistant", "content": m.content} for m in memories]
 
-    async def _create_rolling_summary(
-        self,
-        conversation_id: str,
-        messages: list,
-    ) -> None:
-        """Create a rolling summary of conversation."""
-        try:
-            # Group messages into chunks
-            text = "\n".join([f"{m['role']}: {m['content']}" for m in messages])
-
-            # Simple summarization: extract key facts
-            summary = self._extract_summary_facts(text)
-
-            # Save summary to Redis
-            if self.redis:
-                self.redis.setex(
-                    self._summary_key(conversation_id),
-                    30 * 24 * 60 * 60,  # 30 days
-                    json.dumps(summary, default=str)
-                )
-
-            logger.debug(f"Created rolling summary for {conversation_id}")
-        except Exception as e:
-            logger.error(f"Failed to create summary: {e}")
-
-    @staticmethod
-    def _extract_summary_facts(text: str) -> Dict[str, Any]:
-        """Extract key facts from conversation."""
-        facts = {
-            "key_points": [],
-            "entities": {},
-            "decisions": [],
-        }
-
-        lines = text.split("\n")
-        for line in lines:
-            if "budget" in line.lower():
-                facts["key_points"].append(line)
-            if "confirm" in line.lower() or "agree" in line.lower():
-                facts["decisions"].append(line)
-
-        return facts
-
-    async def update_preferences(
-        self,
-        conversation_id: str,
-        preferences: Dict[str, Any],
-    ) -> None:
-        """Store user preferences for future interactions."""
-        try:
-            async with AsyncSessionLocal() as db:
-                from modules.common.models import ConversationMemory
-
-                result = await db.execute(
-                    select(ConversationMemory).where(
-                        ConversationMemory.conversation_id == uuid.UUID(conversation_id)
-                    )
-                )
-                memory = result.scalars().first()
-
-                if memory:
-                    memory.preferences = {**(memory.preferences or {}), **preferences}
-                    memory.updated_at = datetime.now(timezone.utc)
-                    await db.commit()
-                else:
-                    # Create new memory record
-                    memory = ConversationMemory(
-                        id=uuid.uuid4(),
-                        conversation_id=uuid.UUID(conversation_id),
-                        preferences=preferences,
-                        memory_data={},
-                        completed_fields={},
-                        created_at=datetime.now(timezone.utc),
-                    )
-                    db.add(memory)
-                    await db.commit()
-
-                logger.debug(f"Updated preferences for {conversation_id}")
-        except Exception as e:
-            logger.error(f"Failed to update preferences: {e}")
-
-    async def mark_field_remembered(
-        self,
-        conversation_id: str,
-        field_name: str,
-        value: Any,
-    ) -> None:
-        """Mark that we remember a field to avoid re-asking."""
-        try:
-            async with AsyncSessionLocal() as db:
-                from modules.common.models import ConversationMemory
-
-                result = await db.execute(
-                    select(ConversationMemory).where(
-                        ConversationMemory.conversation_id == uuid.UUID(conversation_id)
-                    )
-                )
-                memory = result.scalars().first()
-
-                if memory:
-                    completed = memory.completed_fields or {}
-                    completed[field_name] = {
-                        "value": value,
-                        "remembered_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    memory.completed_fields = completed
-                    await db.commit()
-                    logger.debug(f"Remembered field: {field_name}")
-        except Exception as e:
-            logger.error(f"Failed to mark field remembered: {e}")
+    async def _create_rolling_summary(self, conversation_id: str) -> None:
+        """Generate a summary of last 20 messages and store in DB."""
+        messages = await self.get_recent_messages(conversation_id, 20)
+        if not messages:
+            return
+        # Simple concatenation – can be replaced with LLM summarisation later
+        summary_text = " ".join([f"{m['role']}: {m['content']}" for m in messages])
+        mem = ConversationMemory(
+            conversation_id=conversation_id,
+            summary_type="message_summary",
+            content=summary_text[:500],
+            created_at=datetime.utcnow(),
+            expires_at=datetime.utcnow() + timedelta(days=30)
+        )
+        self.db.add(mem)
+        await self.db.commit()

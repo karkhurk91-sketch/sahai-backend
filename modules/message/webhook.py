@@ -17,6 +17,7 @@ from modules.ai.rule_processor import get_rule_reply
 from modules.message.sender import send_whatsapp_text, get_whatsapp_config, WhatsAppService
 from modules.common.logger import get_logger
 
+
 # ML imports
 from modules.ml.sentiment import analyze_sentiment
 from modules.ml.intent import simple_intent
@@ -28,6 +29,8 @@ from modules.tasks.message_tasks import process_message_task
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/webhook", tags=["WhatsApp"])
+USE_ORCHESTRATION = os.getenv("USE_ORCHESTRATION", "false").lower() == "true"
+
 
 
 async def download_media_background(
@@ -407,3 +410,14 @@ async def receive_webhook(
         await db.rollback()
 
     return {"status": "ok"}
+
+
+async def handle_whatsapp_webhook(request):
+    # ... parse message, get conversation_id, phone, org_id ...
+    if USE_ORCHESTRATION:
+        from modules.ai.orchestrated_processor import OrchestratedProcessor
+        proc = OrchestratedProcessor()
+        await proc.process_message(conversation_id, phone, message_text, org_id)
+    else:
+        from modules.ai.processor import process_incoming_message
+        await process_incoming_message(conversation_id, phone, message_text, org_id)

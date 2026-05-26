@@ -1,10 +1,33 @@
+# modules/ai/lead_extractor.py
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Union
 from modules.ai.agent import client
 from modules.common.logger import get_logger
 
 logger = get_logger(__name__)
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
+
+
+def _normalize_schema_fields(schema_fields: Union[List[Dict], List[str]]) -> List[Dict]:
+    """
+    Convert schema fields to a unified list of dicts.
+    - If list of strings: create dict with 'name' = string, 'type' = 'string', 'required' = False
+    - If list of dicts: return as is (assumes already correct)
+    """
+    normalized = []
+    for field in schema_fields:
+        if isinstance(field, dict):
+            normalized.append(field)
+        elif isinstance(field, str):
+            normalized.append({
+                "name": field,
+                "label": field,
+                "type": "string",
+                "required": False
+            })
+        else:
+            logger.warning(f"Unexpected schema field type: {type(field)}")
+    return normalized
 
 
 def _format_field_description(field: Dict[str, Any]) -> str:
@@ -43,7 +66,7 @@ def _normalize_value(value: Any, field_type: str):
 
 async def extract_lead_from_conversation(
     conversation_history: List[Dict[str, str]],
-    schema_fields: List[Dict[str, Any]],
+    schema_fields: Union[List[Dict], List[str]],
     extraction_prompt: Optional[str] = None
 ) -> Dict[str, Any]:
     """Extract lead field values from conversation history using Groq."""
@@ -51,7 +74,10 @@ async def extract_lead_from_conversation(
         logger.info("No schema fields provided to extract_lead_from_conversation")
         return {}
 
-    field_descriptions = "\n".join([_format_field_description(field) for field in schema_fields])
+    # Normalise schema fields to a unified dict format
+    normalized_schema = _normalize_schema_fields(schema_fields)
+    field_descriptions = "\n".join([_format_field_description(field) for field in normalized_schema])
+
     system_prompt = extraction_prompt or (
         "You are a lead extraction assistant. "
         "Extract the requested fields from the customer's WhatsApp conversation and return a single JSON object. "
@@ -105,8 +131,7 @@ async def extract_lead_from_conversation(
             return {}
 
         normalized: Dict[str, Any] = {}
-        for field in schema_fields:
-            # Get field name from either 'name', 'field_name', or 'key'
+        for field in normalized_schema:
             name = field.get("name") or field.get("field_name") or field.get("key")
             if not name:
                 continue
@@ -116,6 +141,7 @@ async def extract_lead_from_conversation(
             elif field.get("required") and name:
                 normalized[name] = None
 
+        # Return only fields that have a non‑null, non‑empty value
         return {k: v for k, v in normalized.items() if v is not None and v != ""} or {}
 
     except Exception as e:
