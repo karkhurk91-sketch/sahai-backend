@@ -95,7 +95,7 @@ class OrchestratedProcessor:
                 conv = await self._get_or_create_conversation(db, conversation_id, customer_phone, org_id)
 
                 # 2. Initialise components
-                cache = CacheManager(db)  # updated to use db only, redis internal
+                cache = CacheManager(db_session=db)
                 state_machine = ConversationStateMachine(industry_rules={})
                 memory = MemoryEngine(self.redis, db)
                 parser = BookingDateTimeParser()
