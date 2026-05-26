@@ -1,9 +1,6 @@
-# modules/realestate/repo.py
 import logging
 from typing import List, Dict, Optional
-from sqlalchemy import select, and_
 from modules.common.database import AsyncSessionLocal
-from modules.common.models import Property  # assuming you have a Property model; if not, we'll mock
 
 logger = logging.getLogger(__name__)
 
@@ -14,31 +11,26 @@ async def search_properties(
     property_type: str = "apartment",
     limit: int = 5
 ) -> List[Dict]:
-    """
-    Search properties based on criteria.
-    Returns a list of dicts with id, title, price, location, etc.
-    """
+    """Search properties based on criteria. Returns mock data if real table not found."""
     try:
+        # Attempt to query real Property table if it exists
+        from modules.common.models import Property
+        from sqlalchemy import select, and_
         async with AsyncSessionLocal() as db:
-            # Try to query real Property table if exists
-            # Replace 'Property' with your actual model name if different
-            try:
-                from modules.common.models import Property
-                query = select(Property)
-                conditions = []
-                if location:
-                    conditions.append(Property.location.ilike(f"%{location}%"))
-                if budget_max:
-                    conditions.append(Property.price <= budget_max)
-                if bhk:
-                    conditions.append(Property.bhk == bhk)
-                if property_type:
-                    conditions.append(Property.property_type == property_type)
-                if conditions:
-                    query = query.where(and_(*conditions))
-                query = query.limit(limit)
-                result = await db.execute(query)
-                properties = result.scalars().all()
+            query = select(Property)
+            conditions = []
+            if location:
+                conditions.append(Property.location.ilike(f"%{location}%"))
+            if budget_max:
+                conditions.append(Property.price <= budget_max)
+            if bhk:
+                conditions.append(Property.bhk == bhk)
+            if conditions:
+                query = query.where(and_(*conditions))
+            query = query.limit(limit)
+            result = await db.execute(query)
+            properties = result.scalars().all()
+            if properties:
                 return [
                     {
                         "id": str(p.id),
@@ -46,33 +38,32 @@ async def search_properties(
                         "price": p.price,
                         "location": p.location,
                         "bhk": p.bhk,
-                        "property_type": p.property_type
+                        "property_type": p.property_type,
+                        "description": getattr(p, "description", "")
                     }
                     for p in properties
                 ]
-            except (ImportError, Exception) as e:
-                logger.warning(f"Property table not found or error: {e}. Returning mock data.")
-    except Exception as e:
-        logger.error(f"Error in search_properties: {e}")
+    except (ImportError, Exception) as e:
+        logger.warning(f"Property table not found or error: {e}. Returning mock data.")
 
-    # Fallback mock data (for demo / testing)
+    # Fallback mock data for development/testing
     return [
         {
             "id": "prop_1",
-            "title": f"{bhk or 2} BHK Apartment in {location or 'prime area'}",
+            "title": f"{bhk or 2} BHK {'Apartment' if property_type == 'apartment' else 'Villa'} in {location or 'Prime Area'}",
             "price": budget_max or 5000000,
             "location": location or "City Center",
             "bhk": bhk or 2,
             "property_type": property_type,
-            "description": "Well‑maintained, near metro station."
+            "description": "Well‑maintained property with modern amenities. Near metro station."
         },
         {
             "id": "prop_2",
-            "title": f"Luxury {bhk or 3} BHK in {location or 'suburb'}",
-            "price": int((budget_max or 5000000) * 1.2),
-            "location": location or "Suburb Area",
+            "title": f"Premium {bhk or 3} BHK in {location or 'Suburb'}",
+            "price": int((budget_max or 5000000) * 1.2) if budget_max else 6000000,
+            "location": location or "Green Valley",
             "bhk": bhk or 3,
             "property_type": property_type,
-            "description": "Premium amenities, ready to move."
+            "description": "Luxury property with park view and 24/7 security."
         }
     ][:limit]

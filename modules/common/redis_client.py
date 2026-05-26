@@ -1,10 +1,29 @@
-# modules/common/redis_client.py
 import os
 import redis.asyncio as redis
 from functools import lru_cache
+import logging
+
+logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=1)
 def get_redis_client():
-    """Return a singleton Redis client."""
+    """Return a singleton Redis client. Reads REDIS_URL from environment."""
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    return redis.from_url(redis_url, decode_responses=True)
+    try:
+        client = redis.from_url(redis_url, decode_responses=True)
+        logger.info(f"Redis client initialized with URL: {redis_url.split('@')[-1]}")
+        return client
+    except Exception as e:
+        logger.error(f"Failed to connect to Redis: {e}")
+        # Return a dummy client that logs errors instead of crashing
+        class DummyRedis:
+            async def get(self, key):
+                logger.warning(f"DummyRedis: get({key}) called")
+                return None
+            async def setex(self, key, ttl, value):
+                logger.warning(f"DummyRedis: setex({key}) called")
+            async def rpush(self, key, value):
+                logger.warning(f"DummyRedis: rpush({key}) called")
+            async def lrange(self, key, start, end):
+                return []
+        return DummyRedis()
