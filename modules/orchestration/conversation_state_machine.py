@@ -11,7 +11,6 @@ This module provides deterministic conversation flow control, ensuring:
 from enum import Enum
 from typing import Dict, Optional, Tuple, List
 from datetime import datetime
-from dataclasses import dataclass
 import logging
 
 logger = logging.getLogger(__name__)
@@ -26,15 +25,6 @@ class ConversationStage(str, Enum):
     FOLLOWUP = "followup"
     SUPPORT = "support"
     CLOSED = "closed"
-
-
-@dataclass
-class StageTransition:
-    """Result of stage transition attempt"""
-    success: bool
-    new_stage: Optional[ConversationStage]
-    reason: str
-    required_fields: List[str]
 
 
 class ConversationStateMachine:
@@ -85,11 +75,11 @@ class ConversationStateMachine:
             "timeout_seconds": 300,
         },
         ConversationStage.QUALIFICATION: {
-            "required_fields": [],  # Industry-specific, handled by rules engine
+            "required_fields": [],  # Industry-specific
             "timeout_seconds": 1800,
         },
         ConversationStage.RECOMMENDATION: {
-            "required_fields": [],  # Determined by search results
+            "required_fields": [],
             "timeout_seconds": 600,
         },
         ConversationStage.BOOKING: {
@@ -98,7 +88,7 @@ class ConversationStateMachine:
         },
         ConversationStage.FOLLOWUP: {
             "required_fields": [],
-            "timeout_seconds": 86400,  # 24 hours
+            "timeout_seconds": 86400,
         },
         ConversationStage.SUPPORT: {
             "required_fields": [],
@@ -155,17 +145,30 @@ class ConversationStateMachine:
     
     async def try_advance_stage(
         self,
-        current_stage: ConversationStage,
-        completed_fields: Dict[str, dict],
-        last_intent: Optional[str],
-        user_message: str
-    ) -> StageTransition:
+        conversation,
+        user_message: str,
+        intent: str
+    ) -> Tuple[Optional[str], Optional[str]]:
         """
-        Attempt to advance conversation stage based on collected data.
+        Determine if conversation should advance to next stage.
+        
+        Args:
+            conversation: Conversation object (must have stage, completed_fields, last_intent)
+            user_message: The user's message (unused in current logic but kept for signature)
+            intent: Detected intent from the message
         
         Returns:
-            StageTransition with new stage if possible
+            (new_stage_value, reason) where new_stage_value is a string or None
         """
+        # Extract state from conversation object
+        current_stage_str = getattr(conversation, "conversation_stage", "greeting")
+        try:
+            current_stage = ConversationStage(current_stage_str)
+        except ValueError:
+            current_stage = ConversationStage.GREETING
+        
+        completed_fields = getattr(conversation, "completed_fields", {}) or {}
+        last_intent = getattr(conversation, "last_intent", None)
         
         # Greeting -> Qualification
         if current_stage == ConversationStage.GREETING:
@@ -174,65 +177,33 @@ class ConversationStateMachine:
                     ConversationStage.GREETING,
                     ConversationStage.QUALIFICATION
                 ):
-                    return StageTransition(
-                        success=True,
-                        new_stage=ConversationStage.QUALIFICATION,
-                        reason="Collected name and phone",
-                        required_fields=[]
-                    )
-            return StageTransition(
-                success=False,
-                new_stage=None,
-                reason="Missing name or phone",
-                required_fields=["name", "phone"]
-            )
+                    return ConversationStage.QUALIFICATION.value, "Collected name and phone"
+            return None, "Missing name or phone"
         
         # Qualification -> Recommendation or Booking or Support
         elif current_stage == ConversationStage.QUALIFICATION:
-            # Check intent to decide next stage
             if last_intent == "ready_to_book":
                 if self.is_valid_transition(
                     ConversationStage.QUALIFICATION,
                     ConversationStage.BOOKING
                 ):
-                    return StageTransition(
-                        success=True,
-                        new_stage=ConversationStage.BOOKING,
-                        reason="User ready to book",
-                        required_fields=[]
-                    )
+                    return ConversationStage.BOOKING.value, "User ready to book"
             
             elif last_intent == "need_recommendation":
                 if self.is_valid_transition(
                     ConversationStage.QUALIFICATION,
                     ConversationStage.RECOMMENDATION
                 ):
-                    return StageTransition(
-                        success=True,
-                        new_stage=ConversationStage.RECOMMENDATION,
-                        reason="User needs recommendation",
-                        required_fields=[]
-                    )
+                    return ConversationStage.RECOMMENDATION.value, "User needs recommendation"
             
-            # If enough qualification data, move to recommendation
             if "budget" in completed_fields or "requirements" in completed_fields:
                 if self.is_valid_transition(
                     ConversationStage.QUALIFICATION,
                     ConversationStage.RECOMMENDATION
                 ):
-                    return StageTransition(
-                        success=True,
-                        new_stage=ConversationStage.RECOMMENDATION,
-                        reason="Collected qualification data",
-                        required_fields=[]
-                    )
+                    return ConversationStage.RECOMMENDATION.value, "Collected qualification data"
             
-            return StageTransition(
-                success=False,
-                new_stage=None,
-                reason="Need more qualification information",
-                required_fields=["budget", "requirements"]
-            )
+            return None, "Need more qualification information"
         
         # Recommendation -> Booking
         elif current_stage == ConversationStage.RECOMMENDATION:
@@ -241,32 +212,16 @@ class ConversationStateMachine:
                     ConversationStage.RECOMMENDATION,
                     ConversationStage.BOOKING
                 ):
-                    return StageTransition(
-                        success=True,
-                        new_stage=ConversationStage.BOOKING,
-                        reason="User accepted recommendation",
-                        required_fields=[]
-                    )
+                    return ConversationStage.BOOKING.value, "User accepted recommendation"
             
-            # If user rejected, go back to qualification
             if last_intent == "rejected_recommendation":
                 if self.is_valid_transition(
                     ConversationStage.RECOMMENDATION,
                     ConversationStage.QUALIFICATION
                 ):
-                    return StageTransition(
-                        success=True,
-                        new_stage=ConversationStage.QUALIFICATION,
-                        reason="User rejected recommendation, retry qualification",
-                        required_fields=[]
-                    )
+                    return ConversationStage.QUALIFICATION.value, "User rejected, retry qualification"
             
-            return StageTransition(
-                success=False,
-                new_stage=None,
-                reason="Waiting for recommendation feedback",
-                required_fields=[]
-            )
+            return None, "Waiting for recommendation feedback"
         
         # Booking -> Followup
         elif current_stage == ConversationStage.BOOKING:
@@ -276,19 +231,8 @@ class ConversationStateMachine:
                         ConversationStage.BOOKING,
                         ConversationStage.FOLLOWUP
                     ):
-                        return StageTransition(
-                            success=True,
-                            new_stage=ConversationStage.FOLLOWUP,
-                            reason="Booking confirmed",
-                            required_fields=[]
-                        )
-            
-            return StageTransition(
-                success=False,
-                new_stage=None,
-                reason="Waiting for booking confirmation",
-                required_fields=["booking_date", "booking_time"]
-            )
+                        return ConversationStage.FOLLOWUP.value, "Booking confirmed"
+            return None, "Waiting for booking confirmation"
         
         # Followup -> Closed
         elif current_stage == ConversationStage.FOLLOWUP:
@@ -297,48 +241,21 @@ class ConversationStateMachine:
                     ConversationStage.FOLLOWUP,
                     ConversationStage.CLOSED
                 ):
-                    return StageTransition(
-                        success=True,
-                        new_stage=ConversationStage.CLOSED,
-                        reason="Conversation completed",
-                        required_fields=[]
-                    )
-            
-            return StageTransition(
-                success=False,
-                new_stage=None,
-                reason="In followup stage",
-                required_fields=[]
-            )
+                    return ConversationStage.CLOSED.value, "Conversation completed"
+            return None, "In followup stage"
         
-        # Support can go to many places
+        # Support -> Closed or Booking
         elif current_stage == ConversationStage.SUPPORT:
             if last_intent == "resolved":
                 if self.is_valid_transition(
                     ConversationStage.SUPPORT,
                     ConversationStage.CLOSED
                 ):
-                    return StageTransition(
-                        success=True,
-                        new_stage=ConversationStage.CLOSED,
-                        reason="Issue resolved",
-                        required_fields=[]
-                    )
-            
-            return StageTransition(
-                success=False,
-                new_stage=None,
-                reason="In support stage",
-                required_fields=[]
-            )
+                    return ConversationStage.CLOSED.value, "Issue resolved"
+            return None, "In support stage"
         
         # No transition possible
-        return StageTransition(
-            success=False,
-            new_stage=None,
-            reason=f"Cannot advance from {current_stage.value}",
-            required_fields=[]
-        )
+        return None, f"Cannot advance from {current_stage.value}"
     
     def get_missing_fields(
         self,

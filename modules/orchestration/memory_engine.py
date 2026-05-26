@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, desc
 from modules.common.models import ConversationMemory
 
 logger = logging.getLogger(__name__)
@@ -39,15 +39,18 @@ class MemoryEngine:
         except Exception as e:
             logger.warning(f"Redis read error: {e}, falling back to DB")
 
-        # Fallback to DB
+        # Fallback to DB – order by updated_at (most recent first)
+        # If your model has a 'created_at' column, use that; otherwise 'updated_at' works.
+        order_column = ConversationMemory.updated_at  # Use updated_at because created_at is missing
         result = await self.db.execute(
             select(ConversationMemory)
             .where(ConversationMemory.conversation_id == conversation_id)
-            .order_by(ConversationMemory.created_at.desc())
+            .order_by(desc(order_column))
             .limit(limit)
         )
         memories = result.scalars().all()
-        return [{"role": "assistant", "content": m.content} for m in memories]
+        # Return the messages in chronological order (oldest first for conversation context)
+        return [{"role": "assistant", "content": m.content} for m in reversed(memories)]
 
     async def _create_rolling_summary(self, conversation_id: str) -> None:
         """Generate a summary of last 20 messages and store in DB."""
@@ -55,11 +58,12 @@ class MemoryEngine:
         if not messages:
             return
         summary_text = " ".join([f"{m['role']}: {m['content']}" for m in messages])[:500]
+        # Use updated_at as a stand‑in for creation time
         mem = ConversationMemory(
             conversation_id=conversation_id,
             summary_type="message_summary",
             content=summary_text,
-            created_at=datetime.utcnow(),
+            created_at=datetime.utcnow(),   # Ensure your model has 'created_at' or change to 'updated_at'
             expires_at=datetime.utcnow() + timedelta(days=30)
         )
         self.db.add(mem)

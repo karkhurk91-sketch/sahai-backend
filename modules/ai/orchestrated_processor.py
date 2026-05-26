@@ -95,8 +95,8 @@ class OrchestratedProcessor:
                 conv = await self._get_or_create_conversation(db, conversation_id, customer_phone, org_id)
 
                 # 2. Initialise components
-                cache = CacheManager(db_session=db)
-                state_machine = ConversationStateMachine(industry_rules={})
+                cache = CacheManager(redis_client=self.redis, db_session=db)
+                state_machine = ConversationStateMachine()
                 memory = MemoryEngine(self.redis, db)
                 parser = BookingDateTimeParser()
                 booking_exec = BookingExecutor(db, parser)
@@ -116,8 +116,14 @@ class OrchestratedProcessor:
                     }
 
                 # 4. Detect intent
-                intent, entities = IntentDetector.detect(message)
-
+                detect_result = IntentDetector.detect(message)
+                if isinstance(detect_result, tuple):
+                    intent = detect_result[0]
+                    entities = detect_result[1] if len(detect_result) > 1 else {}
+                else:
+                    intent = detect_result
+                    entities = {}     
+                               
                 # 5. Extract lead data from conversation history
                 history = await memory.get_recent_messages(conversation_id, limit=5)
                 lead_schema = await self._get_active_lead_schema(db, org_id)
@@ -141,7 +147,11 @@ class OrchestratedProcessor:
                             conv.completed_fields[field] = {"value": value, "completed_at": datetime.utcnow().isoformat()}
 
                 # 7. Advance state machine
-                new_stage, reason = await state_machine.try_advance_stage(conv, message, intent)
+                new_stage, reason = await state_machine.try_advance_stage(
+                    conversation=conv,
+                    user_message=message,
+                    intent=intent
+                )
                 if new_stage:
                     state["stage"] = new_stage
                     conv.conversation_stage = new_stage
@@ -149,8 +159,8 @@ class OrchestratedProcessor:
                     logger.info(f"Stage advanced: {conv.conversation_stage} → {new_stage}, reason: {reason}")
 
                 # 8. Determine next action
-                action = await orchestrator.get_next_action(conv, message, {"intent": intent, "entities": extracted_data})
-
+                action = await orchestrator.get_next_action(conv, message, {"intent": intent, "entities": extracted_data}, org_id)
+           
                 # 9. Execute action
                 ai_response = ""
                 lead_id = None
