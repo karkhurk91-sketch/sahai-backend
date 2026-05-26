@@ -119,6 +119,12 @@ class Conversation(Base):
     unread_count = Column(Integer, default=0)
     last_customer_message_at = Column(DateTime, nullable=True)  # without timezone=True
     custom_fields = Column(JSON, default={})
+    # New state machine fields (Phase 1 stabilization)
+    conversation_stage = Column(String(50), default="greeting")  # greeting, qualification, recommendation, booking, followup, support, closed
+    completed_fields = Column(JSON, default={})  # {field_name: {value, completed_at}}
+    booking_status = Column(String(50), nullable=True)  # pending, confirmed, cancelled, completed
+    recommendation_shown = Column(Boolean, default=False)  # Track if recommendation was already shown
+    last_intent = Column(String(100), nullable=True)  # Last detected intent (not LLM-driven)
 
 class Message(Base):
     __tablename__ = "messages"

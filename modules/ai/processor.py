@@ -1,7 +1,7 @@
 import uuid
 import asyncio
 import re
-from datetime import datetime, timedelta, date, time, timezone  # Added timezone
+from datetime import datetime, timedelta, date, time, timezone
 from sqlalchemy import text, select
 from modules.ai.memory_manager import MemoryManager
 from modules.ai.booking_helper import save_booking_generic
@@ -374,10 +374,10 @@ async def _process_and_reply(
         logger.error(f"Booking intent detection failed: {e}", exc_info=True)
 
     # ----- Save conversation summary into memory (always) -----
+    # FIX: Do NOT overwrite the entire context – update only the summary
     try:
-        await memory_manager.save_context(str(conv_uuid), {
-            "facts": context.get("facts", {}),
-            "summary": f"Last message: {customer_message[:200]}... AI replied: {ai_response[:200]}..."
-        })
+        current_context = await memory_manager.get_context(str(conv_uuid))
+        current_context["summary"] = f"Last message: {customer_message[:200]}... AI replied: {ai_response[:200]}..."
+        await memory_manager.save_context(str(conv_uuid), current_context)
     except Exception as e:
         logger.error(f"Failed to save memory: {e}")

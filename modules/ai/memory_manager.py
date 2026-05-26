@@ -1,18 +1,21 @@
 import json
+import os
 import redis.asyncio as redis
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from modules.common.database import AsyncSessionLocal
 from modules.common.models import ConversationMemory
 from modules.common.logger import get_logger
 from datetime import datetime, timezone
 
-
 logger = get_logger(__name__)
 
 class MemoryManager:
-    def __init__(self):
-        self.redis_client = redis.from_url("redis://localhost:6379/0", decode_responses=True)
+    def __init__(self, redis_url: str = None):
+        # Use environment variable or fallback
+        if redis_url is None:
+            redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        self.redis_client = redis.from_url(redis_url, decode_responses=True)
 
     async def get_context(self, conversation_id: str) -> dict:
         """Load short-term context from Redis, fallback to long-term from PostgreSQL."""
