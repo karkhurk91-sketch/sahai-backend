@@ -7,12 +7,14 @@ from pathlib import Path
 import httpx
 import uuid
 import asyncio
+import os
 from datetime import datetime, timezone
 
 from modules.common.config import VERIFY_TOKEN
 from modules.common.database import get_db, AsyncSessionLocal
 from modules.common.models import Organization, Conversation, Message, Lead
 from modules.ai.processor import process_incoming_message
+from modules.ai.orchestrated_processor import OrchestratedProcessor
 from modules.ai.rule_processor import get_rule_reply
 from modules.message.sender import send_whatsapp_text, get_whatsapp_config, WhatsAppService
 from modules.common.logger import get_logger
@@ -30,7 +32,6 @@ from modules.tasks.message_tasks import process_message_task
 logger = get_logger(__name__)
 router = APIRouter(prefix="/webhook", tags=["WhatsApp"])
 USE_ORCHESTRATION = os.getenv("USE_ORCHESTRATION", "false").lower() == "true"
-
 
 
 async def download_media_background(
@@ -395,14 +396,29 @@ async def receive_webhook(
                 logger.info(f"Conversation {conv.id} in human mode – skipping AI reply")
                 return {"status": "ok"}
             else:
-                # Use Celery or BackgroundTasks for AI processing
-                background_tasks.add_task(process_incoming_message, {
-                    "from_number": from_number,
-                    "text": content,
-                    "timestamp": timestamp,
-                    "org_id": str(org_id),
-                    "conversation_id": str(conv.id)
-                })
+                # ---------- Use Feature Flag to choose processor ----------
+                if USE_ORCHESTRATION:
+                    logger.info(f"Using ORCHESTRATED processor for {from_number}")
+                    # Run orchestrated processor in background (it sends its own WhatsApp message)
+                    background_tasks.add_task(
+                        OrchestratedProcessor().process_message,
+                        str(conv.id),
+                        from_number,
+                        content,
+                        str(org_id)
+                    )
+                else:
+                    logger.info(f"Using LEGACY processor for {from_number}")
+                    background_tasks.add_task(
+                        process_incoming_message,
+                        {
+                            "from_number": from_number,
+                            "text": content,
+                            "timestamp": timestamp,
+                            "org_id": str(org_id),
+                            "conversation_id": str(conv.id)
+                        }
+                    )
                 logger.info(f"Scheduled AI processing for message from {from_number}")
 
     except Exception as e:
@@ -410,14 +426,3 @@ async def receive_webhook(
         await db.rollback()
 
     return {"status": "ok"}
-
-
-async def handle_whatsapp_webhook(request):
-    # ... parse message, get conversation_id, phone, org_id ...
-    if USE_ORCHESTRATION:
-        from modules.ai.orchestrated_processor import OrchestratedProcessor
-        proc = OrchestratedProcessor()
-        await proc.process_message(conversation_id, phone, message_text, org_id)
-    else:
-        from modules.ai.processor import process_incoming_message
-        await process_incoming_message(conversation_id, phone, message_text, org_id)
