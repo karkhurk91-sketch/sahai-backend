@@ -21,7 +21,7 @@ from modules.ai.agent import get_agent_for_user_compat
 from modules.ai.lead_extractor import extract_lead_from_conversation
 from modules.message.sender import send_whatsapp_text
 from modules.common.models import Conversation, LeadSchema
-from celery_app import app as celery_app
+from celery_app import celery_app
 import uuid
 
 def is_valid_uuid(val: str) -> bool:

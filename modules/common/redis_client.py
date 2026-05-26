@@ -1,3 +1,4 @@
+# modules/common/redis_client.py
 import os
 import redis.asyncio as redis
 from functools import lru_cache
@@ -11,7 +12,7 @@ def get_redis_client():
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     try:
         client = redis.from_url(redis_url, decode_responses=True)
-        logger.info(f"Redis client initialized with URL: {redis_url.split('@')[-1]}")
+        logger.info(f"Redis client initialized with URL: {redis_url.split('@')[-1] if '@' in redis_url else redis_url}")
         return client
     except Exception as e:
         logger.error(f"Failed to connect to Redis: {e}")
@@ -26,4 +27,11 @@ def get_redis_client():
                 logger.warning(f"DummyRedis: rpush({key}) called")
             async def lrange(self, key, start, end):
                 return []
+            async def delete(self, key):
+                logger.warning(f"DummyRedis: delete({key}) called")
+            async def expire(self, key, ttl):
+                pass
         return DummyRedis()
+
+# Alias for backward compatibility (used by jwt.py and other modules)
+get_redis = get_redis_client
