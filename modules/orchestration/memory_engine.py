@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
-from modules.common.models import ConversationMemory
+from modules.common.models import ConversationMemory, Message
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ class MemoryEngine:
             await self._create_rolling_summary(conversation_id)
 
     async def get_recent_messages(self, conversation_id: str, limit: int = 10) -> List[Dict]:
-        """Return last N messages from Redis (fast) or fallback to DB."""
+        """Return last N messages from Redis (fast) or fallback to Message table."""
         key = f"conv_mem:{conversation_id}:messages"
         try:
             messages = await self.redis.lrange(key, -limit, -1)
@@ -39,32 +39,41 @@ class MemoryEngine:
         except Exception as e:
             logger.warning(f"Redis read error: {e}, falling back to DB")
 
-        # Fallback to DB – order by updated_at (most recent first)
-        # If your model has a 'created_at' column, use that; otherwise 'updated_at' works.
-        order_column = ConversationMemory.updated_at  # Use updated_at because created_at is missing
+        # Fallback to Message table (chronological order)
         result = await self.db.execute(
-            select(ConversationMemory)
-            .where(ConversationMemory.conversation_id == conversation_id)
-            .order_by(desc(order_column))
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.sort_timestamp.desc() if hasattr(Message, 'sort_timestamp') else Message.created_at.desc())
             .limit(limit)
         )
-        memories = result.scalars().all()
-        # Return the messages in chronological order (oldest first for conversation context)
-        return [{"role": "assistant", "content": m.content} for m in reversed(memories)]
+        messages = result.scalars().all()
+        # Return in chronological order (oldest first for context)
+        return [
+            {"role": "user" if msg.direction == "inbound" else "assistant", "content": msg.content}
+            for msg in reversed(messages)
+        ]
 
     async def _create_rolling_summary(self, conversation_id: str) -> None:
-        """Generate a summary of last 20 messages and store in DB."""
+        """Generate a summary of last 20 messages and store in ConversationMemory (last_summary)."""
         messages = await self.get_recent_messages(conversation_id, 20)
         if not messages:
             return
         summary_text = " ".join([f"{m['role']}: {m['content']}" for m in messages])[:500]
-        # Use updated_at as a stand‑in for creation time
-        mem = ConversationMemory(
-            conversation_id=conversation_id,
-            summary_type="message_summary",
-            content=summary_text,
-            created_at=datetime.utcnow(),   # Ensure your model has 'created_at' or change to 'updated_at'
-            expires_at=datetime.utcnow() + timedelta(days=30)
+        # Update or create ConversationMemory record for this conversation
+        result = await self.db.execute(
+            select(ConversationMemory).where(ConversationMemory.conversation_id == conversation_id)
         )
-        self.db.add(mem)
+        mem = result.scalar_one_or_none()
+        if mem:
+            mem.last_summary = summary_text
+            # Optionally update facts with some extracted info
+            mem.updated_at = datetime.utcnow()
+        else:
+            mem = ConversationMemory(
+                conversation_id=conversation_id,
+                last_summary=summary_text,
+                facts={}
+            )
+            self.db.add(mem)
         await self.db.commit()
+        logger.info(f"Rolling summary updated for conversation {conversation_id}")

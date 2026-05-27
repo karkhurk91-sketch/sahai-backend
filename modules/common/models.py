@@ -473,6 +473,5 @@ class ConversationMemory(Base):
     facts = Column(JSON, default={})          # store extracted lead data, preferences, etc.
     last_summary = Column(Text)               # short summary of last conversation
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
     # Relationships
     conversation = relationship("Conversation", backref="memories")

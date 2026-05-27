@@ -11,7 +11,7 @@ from modules.common.database import AsyncSessionLocal
 from modules.common.models import Conversation
 from modules.common.logger import get_logger
 import json
-import redis
+import redis.asyncio as redis  # Use async Redis client
 
 logger = get_logger(__name__)
 
@@ -52,7 +52,8 @@ class ConversationStateManager:
         try:
             # Try Redis first
             if self.redis:
-                state_json = self.redis.get(self._state_key(conversation_id))
+                # AWAIT the get call
+                state_json = await self.redis.get(self._state_key(conversation_id))
                 if state_json:
                     logger.debug(f"Loaded conversation state from Redis: {conversation_id}")
                     return json.loads(state_json)
@@ -74,7 +75,7 @@ class ConversationStateManager:
                     }
                     # Cache in Redis
                     if self.redis:
-                        self.redis.setex(
+                        await self.redis.setex(
                             self._state_key(conversation_id),
                             self.ttl,
                             json.dumps(state, default=str)
@@ -119,7 +120,7 @@ class ConversationStateManager:
 
         # Persist to Redis
         if self.redis:
-            self.redis.setex(
+            await self.redis.setex(
                 self._state_key(conversation_id),
                 self.ttl,
                 json.dumps(current_state, default=str)
@@ -160,7 +161,7 @@ class ConversationStateManager:
         }
 
         if self.redis:
-            self.redis.setex(
+            await self.redis.setex(
                 self._state_key(conversation_id),
                 self.ttl,
                 json.dumps(state, default=str)
@@ -187,7 +188,7 @@ class ConversationStateManager:
         state["last_intent_at"] = datetime.now(timezone.utc).isoformat()
 
         if self.redis:
-            self.redis.setex(
+            await self.redis.setex(
                 self._state_key(conversation_id),
                 self.ttl,
                 json.dumps(state, default=str)

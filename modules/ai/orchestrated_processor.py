@@ -2,8 +2,10 @@
 import uuid
 import os
 import logging
+import asyncio
+import random
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from sqlalchemy.ext.asyncio import AsyncSession
 from modules.common.database import AsyncSessionLocal
 from modules.common.redis_client import get_redis_client
@@ -17,12 +19,15 @@ from modules.orchestration.booking_executor import BookingExecutor, BookingDateT
 from modules.orchestration.lead_merge_service import LeadMergeService
 from modules.orchestration.follow_up_service import FollowUpService
 from modules.orchestration.state_sync import StateSynchronizer
-from modules.ai.agent import get_agent_for_user_compat
+from modules.ai.agent import get_agent_for_user_compat, DEFAULT_MODEL
 from modules.ai.lead_extractor import extract_lead_from_conversation
 from modules.message.sender import send_whatsapp_text
-from modules.common.models import Conversation, LeadSchema
+from modules.common.models import Conversation, LeadSchema, AIConfig
+from modules.ai.rag import search_knowledge
 from celery_app import celery_app
-import uuid
+from modules.orchestration.conversation_state import ConversationStateManager
+from sqlalchemy import select
+from groq import APIStatusError, APIConnectionError
 
 def is_valid_uuid(val: str) -> bool:
     try:
@@ -34,13 +39,122 @@ def is_valid_uuid(val: str) -> bool:
 logger = logging.getLogger(__name__)
 
 class OrchestratedProcessor:
+    # Fallback models for Groq
+    FALLBACK_MODELS: List[str] = [
+        "mixtral-8x7b-32768",
+        "llama3-70b-8192",
+        "gemma2-9b-it",
+    ]
+    MAX_RETRIES: int = 3
+    BASE_RETRY_DELAY: float = 1.0
+    MAX_RETRY_DELAY: float = 60.0
+
     def __init__(self):
         self.redis = get_redis_client()
         self.ws_manager = ConnectionManager()
         self.db_session = AsyncSessionLocal
 
+    async def _get_ai_config(self, db: AsyncSession, org_id: str) -> Optional[AIConfig]:
+        try:
+            stmt = select(AIConfig).where(AIConfig.organization_id == org_id).order_by(AIConfig.updated_at.desc())
+            result = await db.execute(stmt)
+            return result.scalars().first()
+        except Exception as e:
+            logger.error(f"Failed to fetch AI config: {e}")
+            return None
+
+    async def _get_rag_context(self, org_id: str, query: str) -> str:
+        try:
+            chunks = search_knowledge(org_id, query, k=3)
+            if chunks:
+                return "\n\nRelevant information from our knowledge base:\n" + "\n".join(chunks)
+        except Exception as e:
+            logger.warning(f"RAG search failed: {e}")
+        return ""
+
+    async def _call_llm_direct(
+        self,
+        system_prompt: str,
+        user_message: str,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        rag_context: str = ""
+    ) -> str:
+        from modules.ai.agent import client
+        if rag_context:
+            system_prompt = system_prompt + "\n\n" + rag_context
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        return response.choices[0].message.content
+
+    async def _call_llm_with_retry(
+        self,
+        system_prompt: str,
+        user_message: str,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        rag_context: str = ""
+    ) -> str:
+        models_to_try = [model] + [m for m in self.FALLBACK_MODELS if m != model]
+        last_error = None
+        for model_idx, current_model in enumerate(models_to_try):
+            for attempt in range(self.MAX_RETRIES + 1):
+                try:
+                    return await self._call_llm_direct(
+                        system_prompt, user_message, current_model,
+                        temperature, max_tokens, rag_context
+                    )
+                except (APIStatusError, APIConnectionError) as e:
+                    last_error = e
+                    status_code = getattr(e, 'status_code', None)
+                    if status_code == 503:
+                        logger.warning(f"Model {current_model} over capacity (503), switching to next model")
+                        break
+                    if status_code == 429:
+                        retry_after = self._parse_retry_after(e)
+                        wait_time = min(retry_after, self.MAX_RETRY_DELAY)
+                        logger.warning(f"Rate limited on {current_model}, waiting {wait_time}s")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    if status_code and 500 <= status_code < 600:
+                        wait_time = min(
+                            self.BASE_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 0.5),
+                            self.MAX_RETRY_DELAY
+                        )
+                        logger.warning(f"{current_model} error {status_code}, retry {attempt+1} in {wait_time:.2f}s")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    logger.error(f"Non‑retryable error from {current_model}: {e}")
+                    raise
+                except Exception as e:
+                    logger.error(f"Unexpected error with {current_model}: {e}")
+                    last_error = e
+                    break
+            logger.warning(f"Failed with model {current_model}, trying next fallback")
+        raise Exception(f"All models failed. Last error: {last_error}")
+
+    def _parse_retry_after(self, error: APIStatusError) -> float:
+        try:
+            headers = {}
+            if hasattr(error, 'response') and error.response is not None:
+                headers = getattr(error.response, 'headers', {})
+            retry_after = headers.get('retry-after', headers.get('Retry-After', None))
+            if retry_after:
+                return float(retry_after)
+        except Exception:
+            pass
+        return self.BASE_RETRY_DELAY * 2
+
     async def _get_or_create_conversation(self, db: AsyncSession, conversation_id: str, customer_phone: str, org_id: str) -> Conversation:
-        """Helper to fetch or create conversation."""
         conv = await db.get(Conversation, conversation_id)
         if not conv:
             conv = Conversation(
@@ -57,8 +171,6 @@ class OrchestratedProcessor:
         return conv
 
     async def _get_active_lead_schema(self, db: AsyncSession, org_id: str) -> Optional[LeadSchema]:
-        """Fetch active lead schema for organisation."""
-        from sqlalchemy import select
         result = await db.execute(
             select(LeadSchema)
             .where(LeadSchema.organization_id == org_id, LeadSchema.is_active == True)
@@ -67,7 +179,6 @@ class OrchestratedProcessor:
         return result.scalars().first()
 
     async def get_industry_for_org(self, org_id: str):
-        """Return industry instance based on organisation settings."""
         async with AsyncSessionLocal() as db:
             from modules.common.models import Organization
             org = await db.get(Organization, org_id)
@@ -83,29 +194,25 @@ class OrchestratedProcessor:
             from modules.ai.industries.salon import SalonIndustry
             return SalonIndustry()
         else:
-            # Fallback to real estate if unknown industry
             from modules.ai.industries.realestate import RealEstateIndustry
             return RealEstateIndustry()
 
     async def process_message(self, conversation_id: str, customer_phone: str, message: str, org_id: str) -> None:
-        """Main orchestrated message processing pipeline."""
         async with self.db_session() as db:
             try:
-                # 1. Get or create conversation
                 conv = await self._get_or_create_conversation(db, conversation_id, customer_phone, org_id)
 
-                # 2. Initialise components
                 cache = CacheManager(redis_client=self.redis, db_session=db)
-                state_machine = ConversationStateMachine()
+                state_manager = ConversationStateManager(redis_client=self.redis)
                 memory = MemoryEngine(self.redis, db)
                 parser = BookingDateTimeParser()
                 booking_exec = BookingExecutor(db, parser)
                 lead_merge = LeadMergeService(db)
                 follow_up = FollowUpService(db, celery_app)
                 sync = StateSynchronizer(cache, self.ws_manager)
-                orchestrator = WorkflowOrchestrator(state_machine)
+                orchestrator = WorkflowOrchestrator(state_manager)
+                state_machine = ConversationStateMachine()
 
-                # 3. Load current state
                 state = await cache.get_conversation_state(conversation_id)
                 if not state:
                     state = {
@@ -115,16 +222,14 @@ class OrchestratedProcessor:
                         "last_intent": getattr(conv, "last_intent", None)
                     }
 
-                # 4. Detect intent
                 detect_result = IntentDetector.detect(message)
                 if isinstance(detect_result, tuple):
                     intent = detect_result[0]
                     entities = detect_result[1] if len(detect_result) > 1 else {}
                 else:
                     intent = detect_result
-                    entities = {}     
-                               
-                # 5. Extract lead data from conversation history
+                    entities = {}
+
                 history = await memory.get_recent_messages(conversation_id, limit=5)
                 lead_schema = await self._get_active_lead_schema(db, org_id)
                 extracted_data = {}
@@ -134,10 +239,9 @@ class OrchestratedProcessor:
                         lead_schema.schema_fields or [],
                         lead_schema.extraction_prompt
                     )
-                # Merge entities from intent detector
                 extracted_data.update(entities)
 
-                # 6. Update completed fields
+                # ✅ Update both cache, DB, AND local state
                 if extracted_data:
                     for field, value in extracted_data.items():
                         if value:
@@ -145,8 +249,11 @@ class OrchestratedProcessor:
                             if conv.completed_fields is None:
                                 conv.completed_fields = {}
                             conv.completed_fields[field] = {"value": value, "completed_at": datetime.utcnow().isoformat()}
+                            # CRITICAL FIX: also update local state dictionary used for prompt placeholders
+                            if "completed_fields" not in state:
+                                state["completed_fields"] = {}
+                            state["completed_fields"][field] = {"value": value, "completed_at": datetime.utcnow().isoformat()}
 
-                # 7. Advance state machine
                 new_stage, reason = await state_machine.try_advance_stage(
                     conversation=conv,
                     user_message=message,
@@ -158,10 +265,9 @@ class OrchestratedProcessor:
                     await sync.sync_state(conversation_id, org_id, state)
                     logger.info(f"Stage advanced: {conv.conversation_stage} → {new_stage}, reason: {reason}")
 
-                # 8. Determine next action
                 action = await orchestrator.get_next_action(conv, message, {"intent": intent, "entities": extracted_data}, org_id)
-           
-                # 9. Execute action
+
+                rag_context = await self._get_rag_context(org_id, message)
                 ai_response = ""
                 lead_id = None
 
@@ -188,8 +294,25 @@ class OrchestratedProcessor:
 
                 elif action.get("action") == "ask_field":
                     missing_field = action.get("field", "requirements")
-                    agent = get_agent_for_user_compat(customer_phone, org_id)
-                    ai_response = agent.predict(f"Ask the customer for: {missing_field}")
+                    ai_config = await self._get_ai_config(db, org_id)
+                    if ai_config and ai_config.system_prompt:
+                        system_prompt = ai_config.system_prompt
+                        system_prompt = system_prompt.replace("{customer_name}", conv.customer_name or "")
+                        system_prompt = system_prompt.replace("{current_stage}", state.get("stage", ""))
+                        completed_list = ", ".join(state.get("completed_fields", {}).keys())
+                        system_prompt = system_prompt.replace("{completed_fields_list}", completed_list)
+                        user_prompt = f"The customer needs to provide: {missing_field}. Ask them politely for that one thing."
+                        ai_response = await self._call_llm_with_retry(
+                            system_prompt=system_prompt,
+                            user_message=user_prompt,
+                            model=ai_config.model_name or DEFAULT_MODEL,
+                            temperature=ai_config.temperature or 0.7,
+                            max_tokens=ai_config.max_tokens or 500,
+                            rag_context=rag_context
+                        )
+                    else:
+                        agent = get_agent_for_user_compat(customer_phone, org_id)
+                        ai_response = agent.predict(f"Ask the customer for: {missing_field}")
 
                 elif action.get("action") == "show_recommendations":
                     industry = await self.get_industry_for_org(org_id)
@@ -201,11 +324,25 @@ class OrchestratedProcessor:
                         ai_response = "I couldn't find any matching options right now. Could you adjust your criteria?"
 
                 else:
-                    # Fallback to existing AI agent
-                    agent = get_agent_for_user_compat(customer_phone, org_id)
-                    ai_response = agent.predict(message)
+                    ai_config = await self._get_ai_config(db, org_id)
+                    if ai_config and ai_config.system_prompt:
+                        system_prompt = ai_config.system_prompt
+                        system_prompt = system_prompt.replace("{customer_name}", conv.customer_name or "")
+                        system_prompt = system_prompt.replace("{current_stage}", state.get("stage", ""))
+                        completed_list = ", ".join(state.get("completed_fields", {}).keys())
+                        system_prompt = system_prompt.replace("{completed_fields_list}", completed_list)
+                        ai_response = await self._call_llm_with_retry(
+                            system_prompt=system_prompt,
+                            user_message=message,
+                            model=ai_config.model_name or DEFAULT_MODEL,
+                            temperature=ai_config.temperature or 0.7,
+                            max_tokens=ai_config.max_tokens or 500,
+                            rag_context=rag_context
+                        )
+                    else:
+                        agent = get_agent_for_user_compat(customer_phone, org_id)
+                        ai_response = agent.predict(message)
 
-                # 10. Send response
                 if not is_valid_uuid(conversation_id):
                     logger.error(f"Invalid conversation_id: {conversation_id}")
                     await send_whatsapp_text(customer_phone, "Internal error. Please try again.", org_id)
@@ -214,16 +351,12 @@ class OrchestratedProcessor:
                 if not success:
                     logger.error(f"Failed to send WhatsApp message to {customer_phone}")
 
-                # 11. Update memory
                 await memory.add_message(conversation_id, "user", message)
                 await memory.add_message(conversation_id, "assistant", ai_response)
 
-                # 12. Persist conversation
                 conv.last_intent = intent
                 conv.updated_at = datetime.utcnow()
                 await db.commit()
-
-                # 13. Update final cache
                 await cache.set_conversation_state(conversation_id, state)
 
                 logger.info(f"Orchestrated message processed for {conversation_id}")
