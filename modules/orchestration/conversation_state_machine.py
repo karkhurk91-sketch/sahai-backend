@@ -170,15 +170,12 @@ class ConversationStateMachine:
         completed_fields = getattr(conversation, "completed_fields", {}) or {}
         last_intent = getattr(conversation, "last_intent", None)
         
-        # Greeting -> Qualification
+        # Greeting -> Qualification (only name required)
         if current_stage == ConversationStage.GREETING:
-            if "name" in completed_fields and "phone" in completed_fields:
-                if self.is_valid_transition(
-                    ConversationStage.GREETING,
-                    ConversationStage.QUALIFICATION
-                ):
-                    return ConversationStage.QUALIFICATION.value, "Collected name and phone"
-            return None, "Missing name or phone"
+            if "name" in completed_fields:
+                if self.is_valid_transition(ConversationStage.GREETING, ConversationStage.QUALIFICATION):
+                    return ConversationStage.QUALIFICATION.value, "Collected name"
+            return None, "Missing name"
         
         # Qualification -> Recommendation or Booking or Support
         elif current_stage == ConversationStage.QUALIFICATION:

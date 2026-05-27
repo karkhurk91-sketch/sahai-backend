@@ -1,4 +1,3 @@
-# modules/ai/intent_detector.py
 import re
 from typing import Dict, Tuple
 
@@ -47,7 +46,7 @@ class IntentDetector:
         if loc_match:
             entities['location'] = loc_match.group(1).strip()
         else:
-            cities = ['indore', 'mumbai', 'delhi', 'bangalore', 'pune', 'chennai', 'kolkata', 'hyderabad', 'ahmedabad']
+            cities = ['indore', 'mumbai', 'delhi', 'bangalore', 'pune', 'chennai', 'kolkata', 'hyderabad', 'ahmedabad', 'lucknow', 'jaipur']
             for city in cities:
                 if city in message:
                     entities['location'] = city

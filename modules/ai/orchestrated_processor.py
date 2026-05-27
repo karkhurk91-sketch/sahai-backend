@@ -242,7 +242,6 @@ class OrchestratedProcessor:
                     )
                 extracted_data.update(entities)
 
-                # ✅ Update both cache, DB, AND local state
                 if extracted_data:
                     for field, value in extracted_data.items():
                         if value:
@@ -250,12 +249,12 @@ class OrchestratedProcessor:
                             if conv.completed_fields is None:
                                 conv.completed_fields = {}
                             conv.completed_fields[field] = {"value": value, "completed_at": datetime.utcnow().isoformat()}
-                            # CRITICAL FIX: also update local state dictionary used for prompt placeholders
+                            # CRITICAL: Also update local state dictionary used for prompt
                             if "completed_fields" not in state:
                                 state["completed_fields"] = {}
                             state["completed_fields"][field] = {"value": value, "completed_at": datetime.utcnow().isoformat()}
-                            logger.info(f"✅ Captured field: {field} = {value}. Now completed: {list(state['completed_fields'].keys())}")
-
+                            logger.info(f"✅ Captured {field} = {value}. Completed: {list(state['completed_fields'].keys())}")
+                            
                 new_stage, reason = await state_machine.try_advance_stage(
                     conversation=conv,
                     user_message=message,
