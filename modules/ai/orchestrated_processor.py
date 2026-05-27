@@ -221,6 +221,7 @@ class OrchestratedProcessor:
                         "booking_status": getattr(conv, "booking_status", "none"),
                         "last_intent": getattr(conv, "last_intent", None)
                     }
+                logger.info(f"Initial state completed_fields: {state.get('completed_fields', {})}")    
 
                 detect_result = IntentDetector.detect(message)
                 if isinstance(detect_result, tuple):
@@ -253,6 +254,7 @@ class OrchestratedProcessor:
                             if "completed_fields" not in state:
                                 state["completed_fields"] = {}
                             state["completed_fields"][field] = {"value": value, "completed_at": datetime.utcnow().isoformat()}
+                            logger.info(f"✅ Captured field: {field} = {value}. Now completed: {list(state['completed_fields'].keys())}")
 
                 new_stage, reason = await state_machine.try_advance_stage(
                     conversation=conv,
@@ -300,6 +302,8 @@ class OrchestratedProcessor:
                         system_prompt = system_prompt.replace("{customer_name}", conv.customer_name or "")
                         system_prompt = system_prompt.replace("{current_stage}", state.get("stage", ""))
                         completed_list = ", ".join(state.get("completed_fields", {}).keys())
+                        logger.info(f"Completed fields list for prompt: {completed_list}")
+
                         system_prompt = system_prompt.replace("{completed_fields_list}", completed_list)
                         user_prompt = f"The customer needs to provide: {missing_field}. Ask them politely for that one thing."
                         ai_response = await self._call_llm_with_retry(

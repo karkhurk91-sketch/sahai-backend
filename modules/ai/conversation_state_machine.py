@@ -38,14 +38,29 @@ class ConversationStateMachine:
         return True, None
 
     async def try_advance_stage(self, conversation, user_message: str, intent: str) -> Tuple[Optional[str], Optional[str]]:
-        current_stage = ConversationStage[conversation.conversation_stage.upper()]
-        # Use the user's intent, message content, and completed fields to determine
-        # if the conversation should move to the next stage.
-        # (Logic for the `else` branches is a placeholder for your business rules)
-        if current_stage == ConversationStage.GREETING and "name" in (conversation.completed_fields or {}):
-            return ConversationStage.QUALIFICATION.value, "Name captured"
+        # Get current stage and completed fields from the conversation object
+        current_stage_str = getattr(conversation, "conversation_stage", "greeting")
+        try:
+            current_stage = ConversationStage(current_stage_str)
+        except ValueError:
+            current_stage = ConversationStage.GREETING
+        
+        completed_fields = getattr(conversation, "completed_fields", {}) or {}
+
+        # Greeting -> Qualification (only needs name; phone can be collected later)
+        if current_stage == ConversationStage.GREETING:
+            if "name" in completed_fields:
+                if self.is_valid_transition(ConversationStage.GREETING, ConversationStage.QUALIFICATION):
+                    return ConversationStage.QUALIFICATION.value, "Collected name"
+            return None, "Missing name"
+
+        # Qualification -> Booking (if user intent is ready)
         elif current_stage == ConversationStage.QUALIFICATION and intent == "ready_to_book":
-            return ConversationStage.BOOKING.value, "User ready to book"
+            if self.is_valid_transition(ConversationStage.QUALIFICATION, ConversationStage.BOOKING):
+                return ConversationStage.BOOKING.value, "User ready to book"
+            return None, "Invalid transition"
+
+        # No advancement for other stages in this simple version
         else:
             return None, None
 

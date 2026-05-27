@@ -25,7 +25,7 @@ class IntentDetector:
     def _extract_entities(cls, message: str) -> Dict:
         entities = {}
 
-        # Budget extraction (lakh, lakhs, lac, crore, etc.)
+        # Budget
         budget_match = re.search(r'(\d+(?:\.\d+)?)\s*(lac|lakh|cr|crore|लाख|करोड़)', message, re.IGNORECASE)
         if budget_match:
             amount = float(budget_match.group(1))
@@ -37,12 +37,12 @@ class IntentDetector:
             else:
                 entities['budget'] = f"{amount} {unit}"
 
-        # BHK extraction
+        # BHK
         bhk_match = re.search(r'(\d+)\s*(bhk|bedroom|बीएचके|बेडरूम)', message, re.IGNORECASE)
         if bhk_match:
             entities['bhk'] = int(bhk_match.group(1))
 
-        # Location extraction
+        # Location
         loc_match = re.search(r'(?:in|at|near|location|लोकेशन|में)\s+([a-zA-Z\u0900-\u097F]+(?:\s+[a-zA-Z\u0900-\u097F]+)?)', message, re.IGNORECASE)
         if loc_match:
             entities['location'] = loc_match.group(1).strip()
@@ -53,12 +53,12 @@ class IntentDetector:
                     entities['location'] = city
                     break
 
-        # Name extraction
+        # Name
         name_match = re.search(r'(?:my name is|i am|called|name is)\s+([A-Za-z\u0900-\u097F]+)', message, re.IGNORECASE)
         if name_match:
             entities['name'] = name_match.group(1).strip()
 
-        # Phone extraction (10 digits)
+        # Phone
         phone_match = re.search(r'(\d{10})', message)
         if phone_match:
             entities['phone'] = phone_match.group(1)
