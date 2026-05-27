@@ -53,7 +53,7 @@ class ConversationStateMachine:
                 if self.is_valid_transition(ConversationStage.GREETING, ConversationStage.QUALIFICATION):
                     return ConversationStage.QUALIFICATION.value, "Collected name"
             return None, "Missing name"
-
+    
         # Qualification -> Booking (if user intent is ready)
         elif current_stage == ConversationStage.QUALIFICATION and intent == "ready_to_book":
             if self.is_valid_transition(ConversationStage.QUALIFICATION, ConversationStage.BOOKING):

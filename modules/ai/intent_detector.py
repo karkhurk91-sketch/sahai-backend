@@ -24,6 +24,11 @@ class IntentDetector:
     def _extract_entities(cls, message: str) -> Dict:
         entities = {}
 
+        # Add to _extract_entities in intent_detector.py
+        possession_match = re.search(r'(तुरंत|immediate|अभी|जल्दी|asap|now)', message, re.IGNORECASE)
+        if possession_match:
+            entities['possession'] = 'immediate'
+
         # Budget
         budget_match = re.search(r'(\d+(?:\.\d+)?)\s*(lac|lakh|cr|crore|लाख|करोड़)', message, re.IGNORECASE)
         if budget_match:

@@ -39,7 +39,6 @@ def is_valid_uuid(val: str) -> bool:
 logger = logging.getLogger(__name__)
 
 class OrchestratedProcessor:
-    # Fallback models for Groq
     FALLBACK_MODELS: List[str] = [
         "mixtral-8x7b-32768",
         "llama3-70b-8192",
@@ -106,7 +105,7 @@ class OrchestratedProcessor:
     ) -> str:
         models_to_try = [model] + [m for m in self.FALLBACK_MODELS if m != model]
         last_error = None
-        for model_idx, current_model in enumerate(models_to_try):
+        for current_model in models_to_try:
             for attempt in range(self.MAX_RETRIES + 1):
                 try:
                     return await self._call_llm_direct(
@@ -221,7 +220,7 @@ class OrchestratedProcessor:
                         "booking_status": getattr(conv, "booking_status", "none"),
                         "last_intent": getattr(conv, "last_intent", None)
                     }
-                logger.info(f"Initial state completed_fields: {state.get('completed_fields', {})}")    
+                logger.info(f"Initial state completed_fields: {state.get('completed_fields', {})}")
 
                 detect_result = IntentDetector.detect(message)
                 if isinstance(detect_result, tuple):
@@ -249,12 +248,11 @@ class OrchestratedProcessor:
                             if conv.completed_fields is None:
                                 conv.completed_fields = {}
                             conv.completed_fields[field] = {"value": value, "completed_at": datetime.utcnow().isoformat()}
-                            # CRITICAL: Also update local state dictionary used for prompt
                             if "completed_fields" not in state:
                                 state["completed_fields"] = {}
                             state["completed_fields"][field] = {"value": value, "completed_at": datetime.utcnow().isoformat()}
                             logger.info(f"✅ Captured {field} = {value}. Completed: {list(state['completed_fields'].keys())}")
-                            
+
                 new_stage, reason = await state_machine.try_advance_stage(
                     conversation=conv,
                     user_message=message,
@@ -296,26 +294,31 @@ class OrchestratedProcessor:
                 elif action.get("action") == "ask_field":
                     missing_field = action.get("field", "requirements")
                     ai_config = await self._get_ai_config(db, org_id)
+
+                    # ✅ Default system prompt (prevents UnboundLocalError)
+                    system_prompt = "You are a helpful real estate assistant. Never repeat known fields."
                     if ai_config and ai_config.system_prompt:
                         system_prompt = ai_config.system_prompt
-                        system_prompt = system_prompt.replace("{customer_name}", conv.customer_name or "")
-                        system_prompt = system_prompt.replace("{current_stage}", state.get("stage", ""))
-                        completed_list = ", ".join(state.get("completed_fields", {}).keys())
-                        logger.info(f"Completed fields list for prompt: {completed_list}")
 
-                        system_prompt = system_prompt.replace("{completed_fields_list}", completed_list)
-                        user_prompt = f"The customer needs to provide: {missing_field}. Ask them politely for that one thing."
-                        ai_response = await self._call_llm_with_retry(
-                            system_prompt=system_prompt,
-                            user_message=user_prompt,
-                            model=ai_config.model_name or DEFAULT_MODEL,
-                            temperature=ai_config.temperature or 0.7,
-                            max_tokens=ai_config.max_tokens or 500,
-                            rag_context=rag_context
-                        )
-                    else:
-                        agent = get_agent_for_user_compat(customer_phone, org_id)
-                        ai_response = agent.predict(f"Ask the customer for: {missing_field}")
+                    # Replace placeholders
+                    system_prompt = system_prompt.replace("{customer_name}", conv.customer_name or "")
+                    system_prompt = system_prompt.replace("{current_stage}", state.get("stage", ""))
+                    completed_list = ", ".join(state.get("completed_fields", {}).keys())
+                    system_prompt = system_prompt.replace("{completed_fields_list}", completed_list)
+
+                    # Append conversation history
+                    history_text = "\n".join([f"{m['role']}: {m['content']}" for m in history])
+                    system_prompt = system_prompt + f"\n\nPrevious conversation:\n{history_text}\n"
+
+                    user_prompt = f"The customer needs to provide: {missing_field}. Ask them politely for that one thing."
+                    ai_response = await self._call_llm_with_retry(
+                        system_prompt=system_prompt,
+                        user_message=user_prompt,
+                        model=ai_config.model_name if ai_config else DEFAULT_MODEL,
+                        temperature=ai_config.temperature if ai_config else 0.7,
+                        max_tokens=ai_config.max_tokens if ai_config else 500,
+                        rag_context=rag_context
+                    )
 
                 elif action.get("action") == "show_recommendations":
                     industry = await self.get_industry_for_org(org_id)
@@ -328,23 +331,27 @@ class OrchestratedProcessor:
 
                 else:
                     ai_config = await self._get_ai_config(db, org_id)
+
+                    system_prompt = "You are a helpful real estate assistant. Never repeat known fields."
                     if ai_config and ai_config.system_prompt:
                         system_prompt = ai_config.system_prompt
-                        system_prompt = system_prompt.replace("{customer_name}", conv.customer_name or "")
-                        system_prompt = system_prompt.replace("{current_stage}", state.get("stage", ""))
-                        completed_list = ", ".join(state.get("completed_fields", {}).keys())
-                        system_prompt = system_prompt.replace("{completed_fields_list}", completed_list)
-                        ai_response = await self._call_llm_with_retry(
-                            system_prompt=system_prompt,
-                            user_message=message,
-                            model=ai_config.model_name or DEFAULT_MODEL,
-                            temperature=ai_config.temperature or 0.7,
-                            max_tokens=ai_config.max_tokens or 500,
-                            rag_context=rag_context
-                        )
-                    else:
-                        agent = get_agent_for_user_compat(customer_phone, org_id)
-                        ai_response = agent.predict(message)
+
+                    system_prompt = system_prompt.replace("{customer_name}", conv.customer_name or "")
+                    system_prompt = system_prompt.replace("{current_stage}", state.get("stage", ""))
+                    completed_list = ", ".join(state.get("completed_fields", {}).keys())
+                    system_prompt = system_prompt.replace("{completed_fields_list}", completed_list)
+
+                    history_text = "\n".join([f"{m['role']}: {m['content']}" for m in history])
+                    system_prompt = system_prompt + f"\n\nPrevious conversation:\n{history_text}\n"
+
+                    ai_response = await self._call_llm_with_retry(
+                        system_prompt=system_prompt,
+                        user_message=message,
+                        model=ai_config.model_name if ai_config else DEFAULT_MODEL,
+                        temperature=ai_config.temperature if ai_config else 0.7,
+                        max_tokens=ai_config.max_tokens if ai_config else 500,
+                        rag_context=rag_context
+                    )
 
                 if not is_valid_uuid(conversation_id):
                     logger.error(f"Invalid conversation_id: {conversation_id}")
