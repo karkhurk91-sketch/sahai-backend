@@ -22,7 +22,7 @@ from modules.orchestration.state_sync import StateSynchronizer
 from modules.ai.agent import get_agent_for_user_compat, DEFAULT_MODEL
 from modules.ai.lead_extractor import extract_lead_from_conversation
 from modules.message.sender import send_whatsapp_text
-from modules.common.models import Conversation, LeadSchema, AIConfig
+from modules.common.models import Conversation, LeadSchema, AIConfig, Message
 from modules.ai.rag import search_knowledge
 from celery_app import celery_app
 from modules.orchestration.conversation_state import ConversationStateManager
@@ -357,10 +357,38 @@ class OrchestratedProcessor:
                     logger.error(f"Invalid conversation_id: {conversation_id}")
                     await send_whatsapp_text(customer_phone, "Internal error. Please try again.", org_id)
                     return
-                success, _ = await send_whatsapp_text(customer_phone, ai_response, org_id)
+
+                # ✅ Send WhatsApp message and get the message ID
+                success, wamid = await send_whatsapp_text(customer_phone, ai_response, org_id)
                 if not success:
                     logger.error(f"Failed to send WhatsApp message to {customer_phone}")
+                else:
+                    # ✅ Store the outbound message in the messages table
+                    out_msg = Message(
+                        id=uuid.uuid4(),
+                        conversation_id=uuid.UUID(conversation_id),
+                        direction="outbound",
+                        content=ai_response,
+                        is_ai_generated=True,
+                        status="sent",
+                        created_at=datetime.utcnow(),
+                        whatsapp_message_id=wamid,
+                        whatsapp_timestamp=int(datetime.utcnow().timestamp()),
+                        sort_timestamp=datetime.utcnow()
+                    )
+                    db.add(out_msg)
+                    await db.commit()
 
+                    # ✅ Broadcast the new message to the frontend via WebSocket
+                    await sync.broadcast_new_message(conversation_id, org_id, {
+                        "id": str(out_msg.id),
+                        "content": ai_response,
+                        "direction": "outbound",
+                        "created_at": out_msg.created_at.isoformat(),
+                        "status": out_msg.status
+                    })
+
+                # Store in memory (for conversation memory and summarisation)
                 await memory.add_message(conversation_id, "user", message)
                 await memory.add_message(conversation_id, "assistant", ai_response)
 

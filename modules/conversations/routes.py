@@ -11,7 +11,7 @@ from datetime import datetime, timezone   # <-- CRITICAL: added datetime and tim
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Body
 from fastapi.responses import StreamingResponse, FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from modules.common.database import get_db
 from modules.common.models import User, Organization, Conversation, Message

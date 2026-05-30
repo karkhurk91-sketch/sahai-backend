@@ -148,7 +148,7 @@ class Message(Base):
     organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True)
     # New fields for proper message ordering (source of truth: Meta's timestamp)
     whatsapp_timestamp = Column(Integer, nullable=True)  # Unix seconds from Meta's webhook
-    sort_timestamp = Column(DateTime(timezone=True), nullable=True)  # Derived from whatsapp_timestamp
+    sort_timestamp = Column(DateTime(timezone=True), nullable=False)    
     __table_args__ = (
         Index("ix_messages_sort_timestamp", "sort_timestamp"),
         Index("ix_messages_conversation_sort", "conversation_id", "sort_timestamp"),
