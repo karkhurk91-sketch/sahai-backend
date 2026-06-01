@@ -12,7 +12,7 @@ logger = get_logger(__name__)
 async def get_rule_reply(org_id: str, conversation_id: str, user_input: str):
     """
     Returns (reply_text, updated_state) or (None, None) if no rule matched.
-    Also creates a lead when action is 'order_confirmed'.
+    Also creates a lead when action is 'order_confirmed' (restaurant) or 'lead_complete' (real estate).
     """
     # 1. Get organization's business_type
     async with AsyncSessionLocal() as db:
@@ -62,16 +62,17 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str):
         logger.error(f"Rules engine error: {e}")
         return None, None
 
-    # 6. Get static reply from prompts
+    # 6. Get static reply from prompts (pass state for dynamic replies)
     prompts = mod.Prompts(org_id)
-    reply = prompts.get_rule_reply(action, action_data.get("data", {}))
+    reply = prompts.get_rule_reply(action, action_data.get("data", {}), state=state)
 
     if reply is None:
         logger.info(f"No rule reply for action {action} (org {org_id})")
         return None, None
 
-    # 7. If action is order_confirmed, create a lead (for restaurant)
+    # 7. Handle lead creation for different actions
     if action == "order_confirmed":
+        # Restaurant order confirmation
         customer_phone = getattr(state, 'phone', None)
         customer_name = getattr(state, 'name', '')
         order_items = getattr(state, 'order_items', {})
@@ -88,6 +89,36 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str):
             logger.info(f"Lead created for order confirmation: {customer_phone}")
         else:
             logger.warning(f"No customer phone in state, cannot create lead for conversation {conversation_id}")
+
+    elif action == "lead_complete":
+        # Real estate lead completion (all fields collected)
+        lead_data = action_data.get("data", {})
+        # Fallback to state attributes if not in action_data
+        phone = lead_data.get("phone") or getattr(state, 'phone', None)
+        name = lead_data.get("name") or getattr(state, 'name', '')
+        budget = lead_data.get("budget") or getattr(state, 'budget', '')
+        location = lead_data.get("location") or getattr(state, 'location', '')
+        bhk = lead_data.get("bhk") or getattr(state, 'bhk', '')
+        if phone:
+            await create_lead(
+                org_id=org_id,
+                customer_phone=phone,
+                customer_name=name,
+                extracted_data={
+                    "name": name,
+                    "phone": phone,
+                    "budget": budget,
+                    "location": location,
+                    "bhk": bhk
+                },
+                lead_score=80,
+                interest=f"{bhk} BHK in {location}",
+                service="real_estate",
+                intent="buy"
+            )
+            logger.info(f"Lead created from rule mode (real estate) for {phone}")
+        else:
+            logger.warning(f"Cannot create lead: no phone number in state")
 
     # 8. Save updated state back to conversation
     new_state_dict = state.to_dict() if hasattr(state, 'to_dict') else state.__dict__

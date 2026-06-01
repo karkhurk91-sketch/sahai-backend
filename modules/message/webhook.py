@@ -12,13 +12,16 @@ from datetime import datetime, timezone
 
 from modules.common.config import VERIFY_TOKEN
 from modules.common.database import get_db, AsyncSessionLocal
-from modules.common.models import Organization, Conversation, Message, Lead
+from modules.common.models import Organization, Conversation, Message, Lead, LeadSchema
 from modules.ai.processor import process_incoming_message
 from modules.ai.orchestrated_processor import OrchestratedProcessor
 from modules.ai.rule_processor import get_rule_reply
 from modules.message.sender import send_whatsapp_text, get_whatsapp_config, WhatsAppService
 from modules.common.logger import get_logger
 
+# Lead capture imports
+from modules.ai.lead_extractor import extract_lead_from_conversation
+from modules.ai.lead_capture import create_lead
 
 # ML imports
 from modules.ml.sentiment import analyze_sentiment
@@ -132,20 +135,24 @@ async def process_lead_ml_background(lead_id: uuid.UUID, conversation_id: uuid.U
 
 
 async def get_or_create_lead(session: AsyncSession, conversation: Conversation, phone_number: str) -> Lead:
+    # First, try to find lead linked to this conversation
     result = await session.execute(
         select(Lead).where(Lead.conversation_id == conversation.id)
     )
-    lead = result.scalar_one_or_none()
+    lead = result.scalars().first()  # ✅ use .first() instead of .scalar_one_or_none()
+
     if not lead:
+        # Then try to find lead by phone and organisation (most recent)
         result = await session.execute(
             select(Lead)
             .where(Lead.customer_phone == phone_number)
             .where(Lead.organization_id == conversation.organization_id)
             .order_by(Lead.created_at.desc())
-            .limit(1)
         )
-        lead = result.scalar_one_or_none()
+        lead = result.scalars().first()  # ✅ use .first()
+
     if not lead:
+        # Create new lead
         lead = Lead(
             id=uuid.uuid4(),
             organization_id=conversation.organization_id,
@@ -334,7 +341,7 @@ async def receive_webhook(
                 )
             )
 
-            # Create or link Lead
+            # Create or link Lead (basic lead, may be updated later by AI or rule capture)
             lead = await get_or_create_lead(db, conv, from_number)
             await db.commit()
 
@@ -350,7 +357,7 @@ async def receive_webhook(
                     media_content_type or "application/octet-stream"
                 )
 
-            # Schedule ML processing
+            # Schedule ML processing (scoring, sentiment, etc.)
             background_tasks.add_task(
                 process_lead_ml_background,
                 lead.id,
@@ -362,7 +369,7 @@ async def receive_webhook(
             if conv.reply_mode == 'rule':
                 reply, _ = await get_rule_reply(str(org_id), str(conv.id), content)
                 if reply:
-                    # Send reply and save outbound message with proper timestamps
+                    # 1. Send the rule reply immediately
                     success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=str(org_id))
                     if success:
                         now_utc = datetime.now(timezone.utc)
@@ -386,8 +393,84 @@ async def receive_webhook(
                         )
                         await db.commit()
                         logger.info(f"Rule-based reply sent to {from_number}")
-                        return {"status": "ok"}
+
+                    # 2. LEAD CAPTURE in rule mode (silent, does not affect the reply)
+                    try:
+                        # Fetch the active lead schema for this organisation
+                        schema_result = await db.execute(
+                            select(LeadSchema)
+                            .where(LeadSchema.organization_id == org_id, LeadSchema.is_active == True)
+                            .order_by(LeadSchema.updated_at.desc())
+                        )
+                        lead_schema = schema_result.scalars().first() 
+
+                        if lead_schema:
+                            # Get last 5 messages of the conversation as history
+                            msg_result = await db.execute(
+                                select(Message)
+                                .where(Message.conversation_id == conv.id)
+                                .order_by(Message.sort_timestamp.asc())
+                                .limit(5)
+                            )
+                            history_messages = msg_result.scalars().all()
+                            history = [
+                                {"role": "assistant" if msg.direction == "outbound" else "customer", "text": msg.content or ""}
+                                for msg in history_messages
+                            ]
+                            # Ensure current message is included (if not already)
+                            if not history or history[-1]["text"] != content:
+                                history.append({"role": "customer", "text": content})
+
+                            # Extract lead data
+                            extracted_data = await extract_lead_from_conversation(
+                                history,
+                                lead_schema.schema_fields or [],
+                                lead_schema.extraction_prompt
+                            )
+
+                            if extracted_data:
+                                # Create or update lead (reuses the same logic as AI mode)
+                                new_lead_id = await create_lead(
+                                    org_id=str(org_id),
+                                    customer_phone=from_number,
+                                    extracted_data=extracted_data,
+                                    schema_id=str(lead_schema.id),
+                                    conversation_id=str(conv.id),
+                                    customer_name=extracted_data.get("name", ""),
+                                    lead_score=extracted_data.get("lead_score", 70),
+                                    interest=extracted_data.get("interest", ""),
+                                    service=extracted_data.get("service", ""),
+                                    urgency=extracted_data.get("urgency", "medium"),
+                                    intent=extracted_data.get("intent", "general"),
+                                    sentiment=extracted_data.get("sentiment", "neutral"),
+                                    conversion_probability=extracted_data.get("conversion_probability", 0.0),
+                                    follow_up_scheduled_at=extracted_data.get("follow_up_scheduled_at"),
+                                    lead_stage=extracted_data.get("lead_stage", "new"),
+                                    rule_state=extracted_data.get("rule_state", {})
+                                )
+                                logger.info(f"Lead captured in rule mode: {new_lead_id}")
+
+                                # Optional: assign nurturing sequence if lead score is high (≥70)
+                                lead_score = extracted_data.get("lead_score", 70)
+                                if lead_score >= 70:
+                                    default_seq_id = os.getenv("DEFAULT_NURTURING_SEQUENCE_ID")
+                                    if default_seq_id:
+                                        # You can optionally call a service to assign the sequence
+                                        # e.g., from modules.leads.routes import assign_sequence_to_lead
+                                        # await assign_sequence_to_lead(new_lead_id, default_seq_id, db)
+                                        logger.info(f"High score lead {new_lead_id} – would assign sequence {default_seq_id}")
+                            else:
+                                logger.debug("No lead data extracted from rule message")
+                        else:
+                            logger.debug(f"No active lead schema for organisation {org_id} – skipping lead capture")
+
+                    except Exception as e:
+                        logger.error(f"Lead capture in rule mode failed: {e}", exc_info=True)
+                        # Do not propagate – rule reply already sent
+
+                    return {"status": "ok"}
                 else:
+                    # No rule matched – fall back to AI mode
                     logger.info(f"No rule matched, falling back to AI mode")
                     conv.reply_mode = 'ai'
                     await db.commit()
@@ -399,7 +482,6 @@ async def receive_webhook(
                 # ---------- Use Feature Flag to choose processor ----------
                 if USE_ORCHESTRATION:
                     logger.info(f"Using ORCHESTRATED processor for {from_number}")
-                    # Run orchestrated processor in background (it sends its own WhatsApp message)
                     background_tasks.add_task(
                         OrchestratedProcessor().process_message,
                         str(conv.id),

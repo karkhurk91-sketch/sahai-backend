@@ -21,16 +21,20 @@ class DefaultPrompts(BasePrompts):
         }
         return prompts.get(action, "How can I help you?")
 
-    def get_rule_reply(self, action: str, data: dict) -> str | None:
+    def get_rule_reply(self, action, data, state=None):
+        """
+        Return a reply for a given action.
+        The `state` parameter is optional (used by real estate module, ignored here).
+        """
         replies = {
-            "greet": "Hello! Welcome. How can I assist you today?",
-            "ask_menu": "Please visit our website or ask for the menu PDF.",
-            "ask_price": "Our pricing varies by product. Please tell me what you're looking for.",
-            "ask_hours": "We are open 9 AM to 9 PM, Monday to Saturday.",
-            "ask_location": "We are located at [Address]. Would you like the Google Maps link?",
-            "ask_contact": "You can reach us at +91 12345 67890 or email contact@example.com.",
-            "ask_offer": "We currently have a special offer. Please ask our agent for details.",
-            "handle_feedback": "Thank you for your response!",
-            "fallback": "I'm sorry, I didn't understand. Could you please rephrase?"
+            "greeting": "Hello! How can I assist you today?",
+            "ask_name": "May I know your name?",
+            "ask_phone": "Please share your mobile number.",
+            "ask_budget": "What is your budget?",
+            "ask_location": "Which location are you interested in?",
+            "ask_bhk": "How many bedrooms do you need?",
+            "lead_complete": "Thank you! We'll get back to you shortly.",
+            "order_confirmed": "Your order has been confirmed. Thank you!",
+            "fallback": "I didn't understand. Could you please rephrase?",
         }
-        return replies.get(action)
+        return replies.get(action, "How can I help you?")
