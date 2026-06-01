@@ -1,19 +1,23 @@
-from modules.ai.industries.default import DefaultIndustry
-from .prompts import REAL_ESTATE_SYSTEM_PROMPT
+# modules/ai/industries/realestate/__init__.py
 
-class RealEstateIndustry(DefaultIndustry):
+from .state import State
+from .rules_engine import RulesEngine
+from .prompts import Prompts
+
+# Optional: keep for AI mode (if needed)
+class RealEstateIndustry:
     def get_system_prompt(self) -> str:
-        return REAL_ESTATE_SYSTEM_PROMPT
+        return "You are a helpful real estate assistant."
 
     def get_lead_schema(self) -> dict:
         return {
             "name": {"type": "string", "required": True},
-            "interest": {"type": "string", "required": True},
-            "property_type": {"type": "string", "required": True},
-            "bedrooms": {"type": "number"},
-            "min_budget": {"type": "number"},
-            "max_budget": {"type": "number"},
+            "phone": {"type": "string", "required": True},
+            "budget": {"type": "string", "required": True},
             "location": {"type": "string", "required": True},
-            "possession_timeframe": {"type": "string"},
-            "email": {"type": "string"}
+            "bhk": {"type": "string", "required": True},
+            "possession": {"type": "string"},
+            "loan_status": {"type": "string"},
+            "is_decision_maker": {"type": "boolean"},
+            "reason": {"type": "string"},
         }

@@ -253,12 +253,15 @@ async def update_lead(
 async def get_lead_by_conversation(
     conversation_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user)
 ):
-    result = await db.execute(
-        select(Lead).where(Lead.conversation_id == uuid.UUID(conversation_id))
-    )
-    lead = result.scalar_one_or_none()
+    org_id = current_user.get("org_id")
+    stmt = select(Lead).where(
+        Lead.conversation_id == uuid.UUID(conversation_id),
+        Lead.organization_id == uuid.UUID(org_id)
+    ).order_by(Lead.created_at.desc())  # most recent first
+    result = await db.execute(stmt)
+    lead = result.scalars().first()   # ✅ returns first row or None
     if not lead:
         raise HTTPException(status_code=404, detail="Lead not found")
     return lead
