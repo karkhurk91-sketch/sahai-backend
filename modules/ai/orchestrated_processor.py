@@ -295,22 +295,23 @@ class OrchestratedProcessor:
                     missing_field = action.get("field", "requirements")
                     ai_config = await self._get_ai_config(db, org_id)
 
-                    # ✅ Default system prompt (prevents UnboundLocalError)
                     system_prompt = "You are a helpful real estate assistant. Never repeat known fields."
                     if ai_config and ai_config.system_prompt:
                         system_prompt = ai_config.system_prompt
 
-                    # Replace placeholders
                     system_prompt = system_prompt.replace("{customer_name}", conv.customer_name or "")
                     system_prompt = system_prompt.replace("{current_stage}", state.get("stage", ""))
                     completed_list = ", ".join(state.get("completed_fields", {}).keys())
                     system_prompt = system_prompt.replace("{completed_fields_list}", completed_list)
 
-                    # Append conversation history
                     history_text = "\n".join([f"{m['role']}: {m['content']}" for m in history])
                     system_prompt = system_prompt + f"\n\nPrevious conversation:\n{history_text}\n"
 
                     user_prompt = f"The customer needs to provide: {missing_field}. Ask them politely for that one thing."
+
+                    # 🔴 TYPING START
+                    await self.ws_manager.send_typing_start(org_id, conversation_id, "Priya")
+
                     ai_response = await self._call_llm_with_retry(
                         system_prompt=system_prompt,
                         user_message=user_prompt,
@@ -319,6 +320,9 @@ class OrchestratedProcessor:
                         max_tokens=ai_config.max_tokens if ai_config else 500,
                         rag_context=rag_context
                     )
+
+                    # 🔴 TYPING STOP
+                    await self.ws_manager.send_typing_stop(org_id, conversation_id)
 
                 elif action.get("action") == "show_recommendations":
                     industry = await self.get_industry_for_org(org_id)
@@ -344,6 +348,9 @@ class OrchestratedProcessor:
                     history_text = "\n".join([f"{m['role']}: {m['content']}" for m in history])
                     system_prompt = system_prompt + f"\n\nPrevious conversation:\n{history_text}\n"
 
+                    # 🔴 TYPING START
+                    await self.ws_manager.send_typing_start(org_id, conversation_id, "Priya")
+
                     ai_response = await self._call_llm_with_retry(
                         system_prompt=system_prompt,
                         user_message=message,
@@ -353,17 +360,18 @@ class OrchestratedProcessor:
                         rag_context=rag_context
                     )
 
+                    # 🔴 TYPING STOP
+                    await self.ws_manager.send_typing_stop(org_id, conversation_id)
+
                 if not is_valid_uuid(conversation_id):
                     logger.error(f"Invalid conversation_id: {conversation_id}")
                     await send_whatsapp_text(customer_phone, "Internal error. Please try again.", org_id)
                     return
 
-                # ✅ Send WhatsApp message and get the message ID
                 success, wamid = await send_whatsapp_text(customer_phone, ai_response, org_id)
                 if not success:
                     logger.error(f"Failed to send WhatsApp message to {customer_phone}")
                 else:
-                    # ✅ Store the outbound message in the messages table
                     out_msg = Message(
                         id=uuid.uuid4(),
                         conversation_id=uuid.UUID(conversation_id),
@@ -379,7 +387,6 @@ class OrchestratedProcessor:
                     db.add(out_msg)
                     await db.commit()
 
-                    # ✅ Broadcast the new message to the frontend via WebSocket
                     await sync.broadcast_new_message(conversation_id, org_id, {
                         "id": str(out_msg.id),
                         "content": ai_response,
@@ -388,7 +395,6 @@ class OrchestratedProcessor:
                         "status": out_msg.status
                     })
 
-                # Store in memory (for conversation memory and summarisation)
                 await memory.add_message(conversation_id, "user", message)
                 await memory.add_message(conversation_id, "assistant", ai_response)
 
