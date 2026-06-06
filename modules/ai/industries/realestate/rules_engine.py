@@ -41,7 +41,7 @@ class RulesEngine:
 
     # Extraction regex (supports Hinglish, numbers, and variations)
     EXTRACTORS = {
-        "name": r"(?:my name is|i am|called|name is|मेरा नाम)\s*([A-Za-z\u0900-\u097F]+)",
+        "name": r"(?:my name is|i am|called|name is|मेरा नाम)\s*([A-Za-z\u0900-\u097F]+(?:\s+[A-Za-z\u0900-\u097F]+){0,2})",
         "phone": r"(\d{10})",
         "budget": r"(\d+(?:\.\d+)?)\s*(lac|lakh|lakhs|cr|crore|लाख|करोड़)",
         "location": r"(?:in|at|near|location|लोकेशन|में)\s*([A-Za-z\u0900-\u097F]+(?:\s+[A-Za-z\u0900-\u097F]+)?)",
@@ -55,6 +55,71 @@ class RulesEngine:
     def __init__(self):
         self.compiled_extractors = {k: re.compile(v, re.IGNORECASE) for k, v in self.EXTRACTORS.items()}
 
+    def _redact_value(self, field: str, value: str) -> str:
+        if field == "phone" and value:
+            return f"***{value[-4:]}"
+        return value
+
+    def _is_name_candidate(self, text: str) -> bool:
+        trimmed = text.strip()
+        words = trimmed.split()
+        if not 1 <= len(words) <= 3:
+            return False
+        normalized = trimmed.lower()
+        normalized_tokens = re.findall(r"[A-Za-z\u0900-\u097F]+", normalized)
+        if any(kw in normalized for kw in ["budget", "price", "phone", "mobile", "location", "area", "city", "bhk", "bedroom", "loan", "visit", "site"]):
+            return False
+        if any(token in normalized_tokens for token in ["yes", "no", "thanks", "thank"]):
+            return False
+        return all(re.fullmatch(r"[A-Za-z\u0900-\u097F]+", w) for w in words)
+
+    def _is_location_candidate(self, text: str) -> bool:
+        trimmed = text.strip()
+        if not trimmed or len(trimmed) > 50:
+            return False
+        if any(ch.isdigit() for ch in trimmed):
+            return False
+        normalized = trimmed.lower()
+        normalized_tokens = re.findall(r"[A-Za-z\u0900-\u097F]+", normalized)
+        if any(kw in normalized for kw in ["budget", "price", "phone", "mobile", "bhk", "loan", "visit", "site"]):
+            return False
+        if any(token in normalized_tokens for token in ["yes", "no", "thanks", "thank", "buy", "rent", "sell"]):
+            return False
+        return all(re.fullmatch(r"[A-Za-z\u0900-\u097F]+", w) for w in trimmed.split())
+
+    def _fill_awaiting_field(self, text: str, state: State) -> bool:
+        if state.awaiting_field == "name" and not state.name and self._is_name_candidate(text):
+            state.name = text.strip()
+            state.awaiting_field = None
+            logger.info("Captured name from direct response")
+            return True
+
+        if state.awaiting_field == "location" and not state.location and self._is_location_candidate(text):
+            state.location = text.strip()
+            state.awaiting_field = None
+            logger.info("Captured location from direct response")
+            return True
+
+        if state.awaiting_field == "budget" and not state.budget_amount:
+            match = self.compiled_extractors["budget"].search(text)
+            if match:
+                amount = float(match.group(1))
+                unit = match.group(2).lower() if len(match.groups()) > 1 else ""
+                if unit in ["lac", "lakh", "lakhs", "लाख"]:
+                    state.budget = f"{int(amount) if amount.is_integer() else amount} lakh"
+                    state.budget_amount = amount
+                elif unit in ["crore", "cr", "करोड़"]:
+                    state.budget = f"{int(amount) if amount.is_integer() else amount} crore"
+                    state.budget_amount = amount * 100
+                else:
+                    state.budget = f"{amount} lakh"
+                    state.budget_amount = amount
+                state.awaiting_field = None
+                logger.info("Captured budget from direct response")
+                return True
+
+        return False
+
     def detect_intent(self, text: str) -> str:
         text_lower = text.lower()
         for intent, keywords in self.INTENTS.items():
@@ -63,6 +128,7 @@ class RulesEngine:
         return "unknown"
 
     def extract_fields(self, text: str, state: State) -> None:
+        extracted = False
         for field, pattern in self.compiled_extractors.items():
             if getattr(state, field) is None:
                 match = pattern.search(text)
@@ -89,7 +155,7 @@ class RulesEngine:
                         elif "3" in val_lower or "6" in val_lower:
                             state.possession = "3-6 months"
                         else:
-                            state.posmission = "6+ months"
+                            state.possession = "6+ months"
                     elif field == "loan_status":
                         if "cash" in value or "कैश" in value:
                             state.loan_status = "cash"
@@ -112,7 +178,10 @@ class RulesEngine:
                             state.reason = value
                     else:
                         setattr(state, field, value)
-                    logger.info(f"Extracted {field} = {value}")
+                    logger.info(f"Extracted {field} = {self._redact_value(field, value)}")
+                    extracted = True
+        if not extracted:
+            self._fill_awaiting_field(text, state)
 
     def _get_missing_lead_fields(self, state):
         missing = []
@@ -162,56 +231,84 @@ class RulesEngine:
         intent = self.detect_intent(user_input)
         state.last_intent = intent
 
+        # ----- GREETING HANDLING -----
+        if state.stage == "greeting":
+            if intent == "greeting":
+                state.awaiting_field = None
+                logger.info("Greeting detected")
+                return {"action": "greeting", "data": {}}
+            state.stage = "qualification"
+            logger.info("Transitioning from greeting to qualification")
+
         # ----- CONFIRMATION STATE -----
         if state.confirmation_pending:
             if intent == "confirm_yes":
                 state.confirmation_pending = False
                 state.stage = "recommendation"
+                state.awaiting_field = None
                 state.calculate_bant_score()
+                state.pending_summary["lead_tag"] = state.lead_tag
+                logger.info(f"Confirmation accepted; moving to recommendation stage, lead_tag={state.lead_tag}")
                 return {"action": "lead_complete", "data": state.pending_summary}
-            elif intent == "confirm_no" or intent == "correction":
+            if intent == "confirm_no" or intent == "correction":
                 state.confirmation_pending = False
+                state.awaiting_field = None
+                logger.info("Confirmation rejected; requesting correction")
                 return {"action": "ask_which_field_to_correct", "data": {}}
-            else:
-                return {"action": "ask_confirmation_again", "data": {"summary": state.pending_summary}}
+            return {"action": "ask_confirmation_again", "data": {"summary": state.pending_summary}}
 
         # ----- FIELD SELECTION DURING CORRECTION -----
         if intent == "select_field" and not state.pending_correction_field:
             field = user_input.strip().lower()
             if field == "mobile" or field == "contact":
                 field = "phone"
+            if field not in ["name", "budget", "location", "bhk", "phone", "possession", "loan_status", "decision_maker", "reason"]:
+                return {"action": "ask_which_field", "data": {}}
             state.pending_correction_field = field
+            state.awaiting_field = field
+            logger.info(f"Field correction started for {field}")
             return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
+
+        if state.stage == "confirmation" and not state.confirmation_pending and not state.pending_correction_field:
+            field = self._extract_field_to_correct(user_input)
+            if field:
+                state.pending_correction_field = field
+                state.awaiting_field = field
+                logger.info(f"Field correction started for {field}")
+                return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
 
         # ----- DIRECT INTENT HANDLING -----
         if intent == "site_visit":
+            state.awaiting_field = None
             return {"action": "offer_site_visit", "data": {}}
         if intent == "brochure":
+            state.awaiting_field = None
             return {"action": "reply_brochure", "data": {}}
         if intent == "loan":
+            state.awaiting_field = None
             return {"action": "reply_loan", "data": {}}
         if intent.startswith("objection"):
             obj = intent.split("_")[1]
+            state.awaiting_field = None
             return {"action": "handle_objection", "data": {"objection_type": obj}}
         if intent in ["sell", "rent"]:
             pass
 
-        # ----- EXTRACT FIELDS (unless in correction waiting) -----
+        # ----- FIELD EXTRACTION -----
         if not state.pending_correction_field:
             self.extract_fields(user_input, state)
-
-        # ----- STAGE TRANSITION -----
-        if state.stage == "greeting" and intent != "greeting":
-            state.stage = "qualification"
 
         # ----- QUALIFICATION STAGE -----
         if state.stage == "qualification":
             missing_lead = self._get_missing_lead_fields(state)
             if missing_lead:
-                return {"action": f"ask_{missing_lead[0]}", "data": {}}
-            # All mandatory fields collected → move to confirmation
+                next_field = missing_lead[0]
+                state.awaiting_field = next_field
+                return {"action": f"ask_{next_field}", "data": {}}
             state.stage = "confirmation"
             state.confirmation_pending = True
+            state.awaiting_field = None
+            state.calculate_bant_score()
             state.pending_summary = {
                 "name": state.name,
                 "phone": state.phone,
@@ -222,7 +319,9 @@ class RulesEngine:
                 "loan_status": state.loan_status,
                 "is_decision_maker": state.is_decision_maker,
                 "reason": state.reason,
+                "lead_tag": state.lead_tag,
             }
+            logger.info("Confirmation started; summary prepared")
             return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
 
         # ----- CORRECTION HANDLING -----
@@ -230,9 +329,10 @@ class RulesEngine:
             field = self._extract_field_to_correct(user_input)
             if field:
                 state.pending_correction_field = field
+                state.awaiting_field = field
+                logger.info(f"Field correction requested for {field}")
                 return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
-            else:
-                return {"action": "ask_which_field", "data": {}}
+            return {"action": "ask_which_field", "data": {}}
 
         # ----- WAITING FOR NEW VALUE DURING CORRECTION -----
         if state.pending_correction_field:
@@ -251,13 +351,11 @@ class RulesEngine:
                             state.budget_amount = amount * 100
                         else:
                             state.budget_amount = amount
-                elif field == "name":
-                    # Also store a cleaned version if needed
-                    pass
                 state.pending_correction_field = None
-                # Rebuild summary and go back to confirmation
+                state.awaiting_field = None
                 state.stage = "confirmation"
                 state.confirmation_pending = True
+                state.calculate_bant_score()
                 state.pending_summary = {
                     "name": state.name,
                     "phone": state.phone,
@@ -268,15 +366,21 @@ class RulesEngine:
                     "loan_status": state.loan_status,
                     "is_decision_maker": state.is_decision_maker,
                     "reason": state.reason,
+                    "lead_tag": state.lead_tag,
                 }
+                logger.info(f"Field correction applied for {field}")
                 return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
-            else:
-                state.pending_correction_field = None
-                return {"action": "ask_which_field", "data": {}}
+            state.pending_correction_field = None
+            state.awaiting_field = None
+            return {"action": "ask_which_field", "data": {}}
 
         # ----- RECOMMENDATION STAGE -----
         if state.stage == "recommendation":
+            if state.lead_tag is None:
+                state.calculate_bant_score()
+            logger.info(f"Recommendation stage entered, lead_tag={state.lead_tag}")
             return {"action": "recommendation", "data": {"tag": state.lead_tag}}
 
-        # ----- FALLBACK -----
-        return {"action": "fallback", "data": {"intent": intent}}
+        logger.info("Falling back to rule-mode default reply")
+        state.awaiting_field = None
+        return {"action": "fallback", "data": {}}

@@ -25,7 +25,7 @@ class Prompts:
 
         # Greeting
         if action == "greeting":
-            return "Hello! I'm your real estate assistant. Are you looking to buy, rent, or sell a property?"
+            return "Hello! I'm your real estate assistant. Are you looking to buy a property?"
 
         # Asking for missing fields (basic)
         if action.startswith("ask_"):
@@ -106,8 +106,7 @@ class Prompts:
             )
         else:
             return (
-                f"Thank you {name}! I've noted your requirements. "
-                "Our agent will get back to you shortly with the best options."
+                f"Thank you {name}! I have all your details. Would you like me to send you a list of properties that match your criteria?"
             )
 
     def _confirmation_prompt(self, summary: dict) -> str:

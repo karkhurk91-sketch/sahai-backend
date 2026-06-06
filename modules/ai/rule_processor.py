@@ -58,6 +58,9 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str):
     try:
         action_data = rules_engine.process(user_input, state)
         action = action_data["action"]
+        logger.info(
+            f"Rule engine action={action}, intent={state.last_intent}, stage={state.stage}, pending_confirmation={state.confirmation_pending}"
+        )
     except Exception as e:
         logger.error(f"Rules engine error: {e}")
         return None, None
@@ -99,6 +102,8 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str):
         budget = lead_data.get("budget") or getattr(state, 'budget', '')
         location = lead_data.get("location") or getattr(state, 'location', '')
         bhk = lead_data.get("bhk") or getattr(state, 'bhk', '')
+        lead_tag = getattr(state, 'lead_tag', None)
+        lead_score = getattr(state, 'bant_score', 70)
         if phone:
             await create_lead(
                 org_id=org_id,
@@ -109,14 +114,16 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str):
                     "phone": phone,
                     "budget": budget,
                     "location": location,
-                    "bhk": bhk
+                    "bhk": bhk,
+                    "lead_tag": lead_tag,
                 },
-                lead_score=80,
+                lead_score=lead_score,
                 interest=f"{bhk} BHK in {location}",
                 service="real_estate",
-                intent="buy"
+                intent="buy",
+                rule_state=state.to_dict()
             )
-            logger.info(f"Lead created from rule mode (real estate) for {phone}")
+            logger.info(f"Lead created from rule mode (real estate) for {phone}, lead_tag={lead_tag}, score={lead_score}")
         else:
             logger.warning(f"Cannot create lead: no phone number in state")
 

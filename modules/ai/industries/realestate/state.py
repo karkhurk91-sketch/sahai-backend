@@ -28,6 +28,7 @@ class State:
         self.confirmation_pending = False
         self.pending_summary = {}
         self.pending_correction_field = None
+        self.awaiting_field = None
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
