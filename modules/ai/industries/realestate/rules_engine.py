@@ -1,4 +1,3 @@
-# modules/ai/industries/realestate/rules_engine.py
 import re
 import logging
 from .state import State
@@ -320,6 +319,7 @@ class RulesEngine:
             pass
 
         # ----- FIELD EXTRACTION -----
+        # FIX: Always run extraction unless we are waiting for a correction value
         if not state.pending_correction_field:
             self.extract_fields(user_input, state)
 
@@ -328,7 +328,10 @@ class RulesEngine:
             missing_lead = self._get_missing_lead_fields(state)
             if missing_lead:
                 next_field = missing_lead[0]
-                state.awaiting_field = next_field
+                # FIX: Do not re-ask if the field was just filled by extraction
+                # The extraction already cleared awaiting_field when successful
+                if state.awaiting_field != next_field:
+                    state.awaiting_field = next_field
                 return {"action": f"ask_{next_field}", "data": {}}
             state.stage = "confirmation"
             state.confirmation_pending = True

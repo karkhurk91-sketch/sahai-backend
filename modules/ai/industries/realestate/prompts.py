@@ -1,4 +1,3 @@
-# modules/ai/industries/realestate/prompts.py
 from modules.interactive.config_loader import get_interactive_config
 
 class Prompts:
@@ -7,7 +6,53 @@ class Prompts:
         self.industry = "realestate"
 
     def get_rule_reply(self, action: str, data: dict, state=None):
-        # Check for interactive configuration
+        # ADDED: Direct interactive replies for key actions (to avoid repetition and improve UX)
+        # These override any missing config in config_loader.
+        if action == "ask_budget":
+            return {
+                "type": "interactive",
+                "interactive": {
+                    "type": "button",
+                    "body": {"text": "Please select your budget range:"},
+                    "action": {
+                        "buttons": [
+                            {"type": "reply", "reply": {"id": "budget_low", "title": "< ₹20L"}},
+                            {"type": "reply", "reply": {"id": "budget_mid", "title": "₹20–50L"}},
+                            {"type": "reply", "reply": {"id": "budget_high", "title": "> ₹50L"}}
+                        ]
+                    }
+                },
+                "value_map": {
+                    "budget_low": ("budget", "< ₹20L"),
+                    "budget_mid": ("budget", "₹20–50L"),
+                    "budget_high": ("budget", "> ₹50L")
+                }
+            }
+
+        if action == "ask_bhk":
+            return {
+                "type": "interactive",
+                "interactive": {
+                    "type": "button",
+                    "body": {"text": "How many bedrooms (BHK) do you need?"},
+                    "action": {
+                        "buttons": [
+                            {"type": "reply", "reply": {"id": "bhk1", "title": "1 BHK"}},
+                            {"type": "reply", "reply": {"id": "bhk2", "title": "2 BHK"}},
+                            {"type": "reply", "reply": {"id": "bhk3", "title": "3 BHK"}},
+                            {"type": "reply", "reply": {"id": "bhk4", "title": "4+ BHK"}}
+                        ]
+                    }
+                },
+                "value_map": {
+                    "bhk1": ("bhk", "1 BHK"),
+                    "bhk2": ("bhk", "2 BHK"),
+                    "bhk3": ("bhk", "3 BHK"),
+                    "bhk4": ("bhk", "4+ BHK")
+                }
+            }
+
+        # For other actions, try to load from interactive config (if any)
         interactive_config = get_interactive_config(self.industry, action)
         if interactive_config:
             interactive_obj = {
@@ -28,7 +73,7 @@ class Prompts:
                 "value_map": interactive_config.get("value_map", {})
             }
 
-        # Plain text replies
+        # Plain text replies (existing, unchanged)
         if action == "greeting":
             return "Hello! I'm your real estate assistant. Are you looking to buy a property?"
         if action == "ask_name":

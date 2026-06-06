@@ -1,5 +1,3 @@
-# modules/ai/industries/realestate/__init__.py
-
 from .state import State
 from .rules_engine import RulesEngine
 from .prompts import Prompts
