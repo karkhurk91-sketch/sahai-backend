@@ -1,5 +1,4 @@
 # modules/ai/industries/realestate/rules_engine.py
-
 import re
 import logging
 from .state import State
@@ -54,6 +53,12 @@ class RulesEngine:
 
     def __init__(self):
         self.compiled_extractors = {k: re.compile(v, re.IGNORECASE) for k, v in self.EXTRACTORS.items()}
+        # Mapping of interactive button/list IDs to (field, value)
+        self.id_value_map = {}
+
+    def set_id_value_map(self, id_map: dict):
+        """Called by rule_processor to inject value_map from interactive config."""
+        self.id_value_map = id_map
 
     def _redact_value(self, field: str, value: str) -> str:
         if field == "phone" and value:
@@ -128,6 +133,18 @@ class RulesEngine:
         return "unknown"
 
     def extract_fields(self, text: str, state: State) -> None:
+        # First, check if the input is an interactive button/list ID
+        if text in self.id_value_map:
+            field, value = self.id_value_map[text]
+            setattr(state, field, value)
+            if field == "budget":
+                state.budget_amount = self._parse_budget_amount(value)
+            logger.info(f"Mapped interactive ID {text} -> {field}={value}")
+            # Clear awaiting_field if it matches the field we just set
+            if state.awaiting_field == field:
+                state.awaiting_field = None
+            return
+
         extracted = False
         for field, pattern in self.compiled_extractors.items():
             if getattr(state, field) is None:
@@ -183,6 +200,12 @@ class RulesEngine:
         if not extracted:
             self._fill_awaiting_field(text, state)
 
+    def _parse_budget_amount(self, budget_str: str) -> float:
+        match = re.search(r'(\d+(?:\.\d+)?)', budget_str)
+        if match:
+            return float(match.group(1))
+        return 0
+
     def _get_missing_lead_fields(self, state):
         missing = []
         if not state.name:
@@ -193,6 +216,8 @@ class RulesEngine:
             missing.append("location")
         if not state.bhk:
             missing.append("bhk")
+        if not state.possession:
+            missing.append("possession")
         if not state.phone:
             missing.append("phone")
         return missing

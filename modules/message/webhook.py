@@ -237,20 +237,32 @@ async def receive_webhook(
             content = ""
             message_type = "text"
 
-            if msg_type == "text":
-                content = msg_data["text"]["body"]
-                message_type = "text"
-            elif msg_type in {"image", "video", "audio", "document"}:
-                payload = msg_data.get(msg_type, {}) or {}
-                media_whatsapp_id = payload.get("id")
-                caption = payload.get("caption") or ""
-                media_file_name = payload.get("filename")
-                media_content_type = payload.get("mime_type")
-                message_type = msg_type
-                content = caption or f"{msg_type} attachment"
+            # ----- NEW: Handle interactive replies -----
+            if "interactive" in msg_data:
+                interactive = msg_data["interactive"]
+                if interactive["type"] == "button_reply":
+                    content = interactive["button_reply"]["id"]
+                elif interactive["type"] == "list_reply":
+                    content = interactive["list_reply"]["id"]
+                else:
+                    content = ""
+                message_type = "text"  # treat as text for storage
+                # Skip regular parsing below
             else:
-                content = msg_data.get("text", {}).get("body") or msg_data.get(msg_type, {}).get("caption") or f"Unsupported message type: {msg_type}"
-                message_type = msg_type or "text"
+                if msg_type == "text":
+                    content = msg_data["text"]["body"]
+                    message_type = "text"
+                elif msg_type in {"image", "video", "audio", "document"}:
+                    payload = msg_data.get(msg_type, {}) or {}
+                    media_whatsapp_id = payload.get("id")
+                    caption = payload.get("caption") or ""
+                    media_file_name = payload.get("filename")
+                    media_content_type = payload.get("mime_type")
+                    message_type = msg_type
+                    content = caption or f"{msg_type} attachment"
+                else:
+                    content = msg_data.get("text", {}).get("body") or msg_data.get(msg_type, {}).get("caption") or f"Unsupported message type: {msg_type}"
+                    message_type = msg_type or "text"
 
             # Find organization
             result = await db.execute(
@@ -367,7 +379,12 @@ async def receive_webhook(
 
             # ---------- Rule/AI reply handling ----------
             if conv.reply_mode == 'rule':
-                reply, _ = await get_rule_reply(str(org_id), str(conv.id), content)
+                # ✅ Pass from_number as customer_phone (fourth argument)
+                reply, _ = await get_rule_reply(str(org_id), str(conv.id), content, from_number)
+                if reply == "__INTERACTIVE__":
+                    # Interactive message sent; stay in rule mode – no further action
+                    return {"status": "ok"}
+
                 if reply:
                     # 1. Send the rule reply immediately
                     success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=str(org_id))
@@ -455,9 +472,6 @@ async def receive_webhook(
                                 if lead_score >= 70:
                                     default_seq_id = os.getenv("DEFAULT_NURTURING_SEQUENCE_ID")
                                     if default_seq_id:
-                                        # You can optionally call a service to assign the sequence
-                                        # e.g., from modules.leads.routes import assign_sequence_to_lead
-                                        # await assign_sequence_to_lead(new_lead_id, default_seq_id, db)
                                         logger.info(f"High score lead {new_lead_id} – would assign sequence {default_seq_id}")
                             else:
                                 logger.debug("No lead data extracted from rule message")

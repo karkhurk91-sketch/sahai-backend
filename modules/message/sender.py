@@ -11,6 +11,45 @@ from concurrent.futures import ThreadPoolExecutor
 logger = get_logger(__name__)
 _executor = ThreadPoolExecutor(max_workers=2)
 
+async def send_whatsapp_interactive(
+    to_number: str,
+    interactive_data: Dict,
+    org_id: str
+) -> Tuple[bool, Optional[str]]:
+    """
+    Send an interactive message (buttons or list) via WhatsApp Cloud API.
+    interactive_data should be the "interactive" object per WhatsApp API spec.
+    """
+    config = await get_whatsapp_config(org_id)
+    if not config:
+        logger.error(f"No WhatsApp config for org {org_id}")
+        return False, None
+
+    url = f"https://graph.facebook.com/v21.0/{config['phone_number_id']}/messages"
+    headers = {
+        "Authorization": f"Bearer {config['access_token']}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": to_number,
+        "type": "interactive",
+        "interactive": interactive_data
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+            wamid = data.get("messages", [{}])[0].get("id")
+            logger.info(f"Interactive message sent to {to_number}, wamid={wamid}")
+            return True, wamid
+        except Exception as e:
+            logger.error(f"Failed to send interactive message: {e}")
+            return False, None
+
 
 # ---------- Helper: synchronous DB fetch of WhatsApp config ----------
 def _get_whatsapp_config_sync(org_id: str):

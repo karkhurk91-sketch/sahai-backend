@@ -9,10 +9,11 @@ from modules.common.logger import get_logger
 
 logger = get_logger(__name__)
 
-async def get_rule_reply(org_id: str, conversation_id: str, user_input: str):
+async def get_rule_reply(org_id: str, conversation_id: str, user_input: str, customer_phone: str = None):
     """
     Returns (reply_text, updated_state) or (None, None) if no rule matched.
     Also creates a lead when action is 'order_confirmed' (restaurant) or 'lead_complete' (real estate).
+    customer_phone is required for sending interactive messages.
     """
     # 1. Get organization's business_type
     async with AsyncSessionLocal() as db:
@@ -55,6 +56,9 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str):
 
     # 5. Run rules engine
     rules_engine = mod.RulesEngine()
+    # If the state already has an interactive map, give it to the engine
+    if hasattr(state, 'interactive_map') and state.interactive_map:
+        rules_engine.id_value_map = state.interactive_map
     try:
         action_data = rules_engine.process(user_input, state)
         action = action_data["action"]
@@ -69,27 +73,63 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str):
     prompts = mod.Prompts(org_id)
     reply = prompts.get_rule_reply(action, action_data.get("data", {}), state=state)
 
+    # 7. Save updated state back to conversation (MUST be done before returning)
+    new_state_dict = state.to_dict() if hasattr(state, 'to_dict') else state.__dict__
+    async with AsyncSessionLocal() as db:
+        await db.execute(
+            text("UPDATE conversations SET rule_state = :state WHERE id = :conv_id"),
+            {"state": json.dumps(new_state_dict), "conv_id": uuid.UUID(conversation_id)}
+        )
+        await db.commit()
+
+    # ----- NEW: Handle interactive replies -----
+    if isinstance(reply, dict) and reply.get("type") == "interactive":
+        interactive_data = reply.get("interactive")
+        value_map = reply.get("value_map", {})
+        # Store the value_map in the state for future mapping of button/list replies
+        state.interactive_map = value_map
+        rules_engine.id_value_map = value_map
+        # Also save the map into the conversation state (will be persisted on next message)
+        # We need to update the state again to include the map
+        updated_state_dict = state.to_dict() if hasattr(state, 'to_dict') else state.__dict__
+        async with AsyncSessionLocal() as db:
+            await db.execute(
+                text("UPDATE conversations SET rule_state = :state WHERE id = :conv_id"),
+                {"state": json.dumps(updated_state_dict), "conv_id": uuid.UUID(conversation_id)}
+            )
+            await db.commit()
+        # Send interactive message
+        if customer_phone:
+            from modules.message.sender import send_whatsapp_interactive
+            success, wamid = await send_whatsapp_interactive(customer_phone, interactive_data, org_id)
+            if success:
+                logger.info(f"Interactive message sent to {customer_phone}, wamid={wamid}")
+        else:
+            logger.error("Cannot send interactive message: customer_phone missing")
+        # Return special marker to indicate interactive was sent (no text reply)
+        return "__INTERACTIVE__", updated_state_dict
+
     if reply is None:
         logger.info(f"No rule reply for action {action} (org {org_id})")
-        return None, None
+        return None, new_state_dict
 
-    # 7. Handle lead creation for different actions
+    # 8. Handle lead creation for different actions
     if action == "order_confirmed":
         # Restaurant order confirmation
-        customer_phone = getattr(state, 'phone', None)
+        customer_phone_state = getattr(state, 'phone', None)
         customer_name = getattr(state, 'name', '')
         order_items = getattr(state, 'order_items', {})
         interest = f"Order: {', '.join(f'{qty}x {item}' for item, qty in order_items.items())}" if order_items else "Placed an order"
-        if customer_phone:
+        if customer_phone_state:
             await create_lead(
                 org_id=org_id,
-                customer_phone=customer_phone,
+                customer_phone=customer_phone_state,
                 interest=interest,
                 service="restaurant",
                 customer_name=customer_name,
                 lead_score=85
             )
-            logger.info(f"Lead created for order confirmation: {customer_phone}")
+            logger.info(f"Lead created for order confirmation: {customer_phone_state}")
         else:
             logger.warning(f"No customer phone in state, cannot create lead for conversation {conversation_id}")
 
@@ -126,15 +166,6 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str):
             logger.info(f"Lead created from rule mode (real estate) for {phone}, lead_tag={lead_tag}, score={lead_score}")
         else:
             logger.warning(f"Cannot create lead: no phone number in state")
-
-    # 8. Save updated state back to conversation
-    new_state_dict = state.to_dict() if hasattr(state, 'to_dict') else state.__dict__
-    async with AsyncSessionLocal() as db:
-        await db.execute(
-            text("UPDATE conversations SET rule_state = :state WHERE id = :conv_id"),
-            {"state": json.dumps(new_state_dict), "conv_id": uuid.UUID(conversation_id)}
-        )
-        await db.commit()
 
     logger.info(f"Rule mode reply generated: {reply[:50]}...")
     return reply, new_state_dict

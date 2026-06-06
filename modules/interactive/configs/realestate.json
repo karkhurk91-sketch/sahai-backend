@@ -1,0 +1,92 @@
+{
+    "ask_budget": {
+        "type": "button",
+        "body": "What is your budget range?",
+        "action": {
+            "buttons": [
+                {"type": "reply", "reply": {"id": "budget_less_20", "title": "< ₹20L"}},
+                {"type": "reply", "reply": {"id": "budget_20_50", "title": "₹20–50L"}},
+                {"type": "reply", "reply": {"id": "budget_more_50", "title": "> ₹50L"}}
+            ]
+        },
+        "value_map": {
+            "budget_less_20": "< ₹20 lakh",
+            "budget_20_50": "₹20–50 lakh",
+            "budget_more_50": "> ₹50 lakh"
+        }
+    },
+    "ask_location": {
+        "type": "list",
+        "header": "Select preferred location",
+        "body": "Choose one from the list",
+        "footer": "Indore properties",
+        "action": {
+            "button": "View locations",
+            "sections": [
+                {
+                    "title": "Popular Areas",
+                    "rows": [
+                        {"id": "loc_rajendra", "title": "Rajendra Nagar"},
+                        {"id": "loc_vijay", "title": "Vijay Nagar"},
+                        {"id": "loc_scheme78", "title": "Scheme No. 78"}
+                    ]
+                }
+            ]
+        },
+        "value_map": {
+            "loc_rajendra": "Rajendra Nagar",
+            "loc_vijay": "Vijay Nagar",
+            "loc_scheme78": "Scheme No. 78"
+        }
+    },
+    "ask_bhk": {
+        "type": "button",
+        "body": "How many bedrooms do you need?",
+        "action": {
+            "buttons": [
+                {"type": "reply", "reply": {"id": "bhk_1", "title": "1 BHK"}},
+                {"type": "reply", "reply": {"id": "bhk_2", "title": "2 BHK"}},
+                {"type": "reply", "reply": {"id": "bhk_3", "title": "3 BHK"}},
+                {"type": "reply", "reply": {"id": "bhk_3plus", "title": "3+ BHK"}}
+            ]
+        },
+        "value_map": {
+            "bhk_1": "1 BHK",
+            "bhk_2": "2 BHK",
+            "bhk_3": "3 BHK",
+            "bhk_3plus": "3+ BHK"
+        }
+    },
+    "ask_possession": {
+        "type": "button",
+        "body": "When would you like to move in?",
+        "action": {
+            "buttons": [
+                {"type": "reply", "reply": {"id": "possession_immediate", "title": "Immediate"}},
+                {"type": "reply", "reply": {"id": "possession_1_2", "title": "1-2 months"}},
+                {"type": "reply", "reply": {"id": "possession_3_6", "title": "3-6 months"}},
+                {"type": "reply", "reply": {"id": "possession_6plus", "title": "6+ months"}}
+            ]
+        },
+        "value_map": {
+            "possession_immediate": "immediate",
+            "possession_1_2": "1-2 months",
+            "possession_3_6": "3-6 months",
+            "possession_6plus": "6+ months"
+        }
+    },
+    "ask_confirmation": {
+        "type": "button",
+        "body": "Please confirm your details:",
+        "action": {
+            "buttons": [
+                {"type": "reply", "reply": {"id": "confirm_yes", "title": "Confirm"}},
+                {"type": "reply", "reply": {"id": "confirm_no", "title": "Change"}}
+            ]
+        },
+        "value_map": {
+            "confirm_yes": "confirm",
+            "confirm_no": "change"
+        }
+    }
+}
