@@ -30,6 +30,11 @@ class State:
         self.pending_correction_field = None
         self.awaiting_field = None
 
+        self.budget_confirmed = False
+
+        self.interactive_map = {} 
+
+
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}
 

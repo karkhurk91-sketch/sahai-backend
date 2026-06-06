@@ -6,8 +6,7 @@ class Prompts:
         self.industry = "realestate"
 
     def get_rule_reply(self, action: str, data: dict, state=None):
-        # ADDED: Direct interactive replies for key actions (to avoid repetition and improve UX)
-        # These override any missing config in config_loader.
+        # Direct interactive replies for key actions (override config_loader)
         if action == "ask_budget":
             return {
                 "type": "interactive",
@@ -39,16 +38,14 @@ class Prompts:
                         "buttons": [
                             {"type": "reply", "reply": {"id": "bhk1", "title": "1 BHK"}},
                             {"type": "reply", "reply": {"id": "bhk2", "title": "2 BHK"}},
-                            {"type": "reply", "reply": {"id": "bhk3", "title": "3 BHK"}},
-                            {"type": "reply", "reply": {"id": "bhk4", "title": "4+ BHK"}}
+                            {"type": "reply", "reply": {"id": "bhk3", "title": "3 BHK"}}
                         ]
                     }
                 },
                 "value_map": {
                     "bhk1": ("bhk", "1 BHK"),
                     "bhk2": ("bhk", "2 BHK"),
-                    "bhk3": ("bhk", "3 BHK"),
-                    "bhk4": ("bhk", "4+ BHK")
+                    "bhk3": ("bhk", "3 BHK")
                 }
             }
 
@@ -73,41 +70,89 @@ class Prompts:
                 "value_map": interactive_config.get("value_map", {})
             }
 
-        # Plain text replies (existing, unchanged)
+        # Plain text replies
         if action == "greeting":
             return "Hello! I'm your real estate assistant. Are you looking to buy a property?"
         if action == "ask_name":
             return "May I know your name?"
-        if action == "ask_phone":
-            return "Please share your mobile number."
         if action == "ask_which_field_to_correct":
-            return "Which detail would you like to change? (budget / location / bhk / name / phone / possession)"
+            return "Which detail would you like to change? (budget / location / bhk / name / possession)"
         if action == "ask_which_field":
-            return "I didn't catch which field. Please say the field name (budget, location, bhk, name, phone, possession)."
+            return "I didn't catch which field. Please say the field name (budget, location, bhk, name, possession)."
         if action.startswith("ask_new_value_for_"):
             field = action.split("_")[-1]
             return f"Please provide the new value for {field}."
+
+        # Confirmation – dynamically built with all details
         if action == "ask_confirmation":
-            summary = data.get("summary", {})
-            return self._confirmation_prompt(summary)
+            # Try to get summary from data, otherwise fallback to state
+            if data.get("summary"):
+                summary = data["summary"]
+            elif state:
+                summary = {
+                    "name": state.name or "Not provided",
+                    "budget": state.budget or "Not provided",
+                    "location": state.location or "Not provided",
+                    "bhk": state.bhk or "Not provided",
+                    "possession": state.possession or "Not specified"
+                }
+            else:
+                summary = {}
+
+            name = summary.get("name", "Not provided")
+            budget = summary.get("budget", "Not provided")
+            location = summary.get("location", "Not provided")
+            bhk = summary.get("bhk", "Not provided")
+            possession = summary.get("possession", "Not specified")
+
+            confirmation_text = (
+                f"Please confirm your details:\n"
+                f"• Name: {name}\n"
+                f"• Budget: {budget}\n"
+                f"• Location: {location}\n"
+                f"• BHK: {bhk}\n"
+                f"• Possession: {possession}"
+            )
+
+            return {
+                "type": "interactive",
+                "interactive": {
+                    "type": "button",
+                    "body": {"text": confirmation_text},
+                    "action": {
+                        "buttons": [
+                            {"type": "reply", "reply": {"id": "confirm_yes", "title": "Confirm"}},
+                            {"type": "reply", "reply": {"id": "confirm_no", "title": "Change"}}
+                        ]
+                    }
+                },
+                "value_map": {
+                    "confirm_yes": ["confirm", True],
+                    "confirm_no": ["confirm", False]
+                }
+            }
+
         if action == "lead_complete":
             return self._lead_complete_reply(data, state)
+
         if action == "recommendation":
             tag = data.get("tag", "warm")
             if tag == "hot":
                 return "Great! Based on your requirements, I have a few options. Here are two: one near the metro for ₹48L and another near the park for ₹52L. Would you like to schedule a site visit?"
             else:
                 return "Thank you! I have all your details. Would you like me to send you a list of properties that match your criteria?"
+
         if action == "fallback":
             return "I'm here to help with property prices, brochures, site visits, loans, or any other details. Could you please rephrase your question?"
+
         return "How can I help you with your property needs today?"
 
     def _confirmation_prompt(self, summary):
+        # Kept for compatibility (not used directly because ask_confirmation is handled above)
         name = summary.get("name", "Not provided")
         budget = summary.get("budget", "Not provided")
         location = summary.get("location", "Not provided")
         bhk = summary.get("bhk", "Not provided")
-        phone = summary.get("phone", "Not provided")
         possession = summary.get("possession", "Not specified")
         return (
             f"Please confirm your details:\n"
@@ -115,7 +160,6 @@ class Prompts:
             f"• Budget: {budget}\n"
             f"• Location: {location}\n"
             f"• BHK: {bhk}\n"
-            f"• Phone: {phone}\n"
             f"• Possession: {possession}\n"
             f"Reply with 'Confirm' or 'Change'."
         )
@@ -127,6 +171,6 @@ class Prompts:
         budget = data.get("budget") or ""
         tag = data.get("lead_tag", "warm")
         if tag == "hot":
-            return f"Thanks {name}! We have {bhk} BHK options in {location} within {budget}. Would you like to schedule a site visit or see photos?"
+            return f"Thanks {name}! We have {bhk} BHK options in {location} within {budget}. Would you like to schedule a site visit?"
         else:
-            return f"Thank you {name}! I have all your details. Would you like me to send you a list of properties that match your criteria?"
+            return f"Thank you {name}! Our real estate agent will call you as soon as possible to understand your requirements and plan a site visit."

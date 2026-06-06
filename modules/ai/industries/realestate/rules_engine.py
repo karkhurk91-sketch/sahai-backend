@@ -132,17 +132,32 @@ class RulesEngine:
         return "unknown"
 
     def extract_fields(self, text: str, state: State) -> None:
-        # First, check if the input is an interactive button/list ID
         if text in self.id_value_map:
-            field, value = self.id_value_map[text]
+            mapping = self.id_value_map[text]
+            
+            if isinstance(mapping, (tuple, list)) and len(mapping) == 2:
+                field, value = mapping
+            elif isinstance(mapping, str):
+                # Use the currently awaited field
+                field = state.awaiting_field
+                if not field:
+                    # Fallback: determine the next missing field
+                    missing = self._get_missing_lead_fields(state)
+                    field = missing[0] if missing else "location"
+                value = mapping
+                logger.info(f"String mapping for {text} -> using field={field}, value={value}")
+            else:
+                logger.error(f"Invalid value_map entry for {text}: {mapping}")
+                return
+            
             setattr(state, field, value)
             if field == "budget":
                 state.budget_amount = self._parse_budget_amount(value)
-            logger.info(f"Mapped interactive ID {text} -> {field}={value}")
-            # Clear awaiting_field if it matches the field we just set
+                state.budget_confirmed = True
             if state.awaiting_field == field:
                 state.awaiting_field = None
             return
+    
 
         extracted = False
         for field, pattern in self.compiled_extractors.items():
@@ -162,6 +177,7 @@ class RulesEngine:
                         else:
                             state.budget = f"{amount} lakh"
                             state.budget_amount = amount
+                        state.budget_confirmed = True
                     elif field == "possession":
                         val_lower = value.lower()
                         if "immediate" in val_lower or "now" in val_lower or "asap" in val_lower or "तुरंत" in val_lower:
@@ -200,10 +216,11 @@ class RulesEngine:
             self._fill_awaiting_field(text, state)
 
     def _parse_budget_amount(self, budget_str: str) -> float:
+        # Enhanced to handle ranges and symbols (e.g. "< ₹20L", "₹20–50L", "> ₹50L")
         match = re.search(r'(\d+(?:\.\d+)?)', budget_str)
         if match:
             return float(match.group(1))
-        return 0
+        return 0.0
 
     def _get_missing_lead_fields(self, state):
         missing = []
@@ -217,8 +234,6 @@ class RulesEngine:
             missing.append("bhk")
         if not state.possession:
             missing.append("possession")
-        if not state.phone:
-            missing.append("phone")
         return missing
 
     def _get_missing_bant_fields(self, state):
@@ -252,6 +267,10 @@ class RulesEngine:
         return None
 
     def process(self, user_input: str, state: State) -> dict:
+        # CRITICAL FIX: Restore interactive map from persisted state
+        if hasattr(state, 'interactive_map') and state.interactive_map:
+            self.id_value_map = state.interactive_map
+
         intent = self.detect_intent(user_input)
         state.last_intent = intent
 
@@ -284,9 +303,7 @@ class RulesEngine:
         # ----- FIELD SELECTION DURING CORRECTION -----
         if intent == "select_field" and not state.pending_correction_field:
             field = user_input.strip().lower()
-            if field == "mobile" or field == "contact":
-                field = "phone"
-            if field not in ["name", "budget", "location", "bhk", "phone", "possession", "loan_status", "decision_maker", "reason"]:
+            if field not in ["name", "budget", "location", "bhk", "possession", "loan_status", "decision_maker", "reason"]:
                 return {"action": "ask_which_field", "data": {}}
             state.pending_correction_field = field
             state.awaiting_field = field
@@ -319,38 +336,69 @@ class RulesEngine:
             pass
 
         # ----- FIELD EXTRACTION -----
-        # FIX: Always run extraction unless we are waiting for a correction value
         if not state.pending_correction_field:
             self.extract_fields(user_input, state)
 
-        # ----- QUALIFICATION STAGE -----
+        # ----- QUALIFICATION STAGE (with enhanced protection) -----
         if state.stage == "qualification":
+            # If we are already waiting for a field, just keep asking that field.
+            if state.awaiting_field:
+                # Do not ask budget again if it was already confirmed
+                if state.awaiting_field == "budget" and (state.budget_amount is not None or getattr(state, "budget_confirmed", False)):
+                    # Budget already collected – clear waiting flag and recalc
+                    state.awaiting_field = None
+                    missing_lead = self._get_missing_lead_fields(state)
+                    if missing_lead:
+                        next_field = missing_lead[0]
+                        state.awaiting_field = next_field
+                        return {"action": f"ask_{next_field}", "data": {}}
+                    else:
+                        # All fields collected, move to confirmation
+                        state.stage = "confirmation"
+                        state.confirmation_pending = True
+                        state.awaiting_field = None
+                        state.calculate_bant_score()
+                        state.pending_summary = {
+                            "name": state.name,
+                            "phone": state.phone,
+                            "budget": state.budget,
+                            "location": state.location,
+                            "bhk": state.bhk,
+                            "possession": state.possession,
+                            "loan_status": state.loan_status,
+                            "is_decision_maker": state.is_decision_maker,
+                            "reason": state.reason,
+                            "lead_tag": state.lead_tag,
+                        }
+                        logger.info("Confirmation started; summary prepared")
+                        return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
+                return {"action": f"ask_{state.awaiting_field}", "data": {}}
+
             missing_lead = self._get_missing_lead_fields(state)
             if missing_lead:
                 next_field = missing_lead[0]
-                # FIX: Do not re-ask if the field was just filled by extraction
-                # The extraction already cleared awaiting_field when successful
-                if state.awaiting_field != next_field:
-                    state.awaiting_field = next_field
+                state.awaiting_field = next_field
                 return {"action": f"ask_{next_field}", "data": {}}
-            state.stage = "confirmation"
-            state.confirmation_pending = True
-            state.awaiting_field = None
-            state.calculate_bant_score()
-            state.pending_summary = {
-                "name": state.name,
-                "phone": state.phone,
-                "budget": state.budget,
-                "location": state.location,
-                "bhk": state.bhk,
-                "possession": state.possession,
-                "loan_status": state.loan_status,
-                "is_decision_maker": state.is_decision_maker,
-                "reason": state.reason,
-                "lead_tag": state.lead_tag,
-            }
-            logger.info("Confirmation started; summary prepared")
-            return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
+            else:
+                # All lead fields collected → move to confirmation
+                state.stage = "confirmation"
+                state.confirmation_pending = True
+                state.awaiting_field = None
+                state.calculate_bant_score()
+                state.pending_summary = {
+                    "name": state.name,
+                    "phone": state.phone,
+                    "budget": state.budget,
+                    "location": state.location,
+                    "bhk": state.bhk,
+                    "possession": state.possession,
+                    "loan_status": state.loan_status,
+                    "is_decision_maker": state.is_decision_maker,
+                    "reason": state.reason,
+                    "lead_tag": state.lead_tag,
+                }
+                logger.info("Confirmation started; summary prepared")
+                return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
 
         # ----- CORRECTION HANDLING -----
         if intent == "correction":

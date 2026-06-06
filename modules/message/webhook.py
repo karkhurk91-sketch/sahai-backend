@@ -139,7 +139,7 @@ async def get_or_create_lead(session: AsyncSession, conversation: Conversation, 
     result = await session.execute(
         select(Lead).where(Lead.conversation_id == conversation.id)
     )
-    lead = result.scalars().first()  # ✅ use .first() instead of .scalar_one_or_none()
+    lead = result.scalars().first()
 
     if not lead:
         # Then try to find lead by phone and organisation (most recent)
@@ -149,7 +149,7 @@ async def get_or_create_lead(session: AsyncSession, conversation: Conversation, 
             .where(Lead.organization_id == conversation.organization_id)
             .order_by(Lead.created_at.desc())
         )
-        lead = result.scalars().first()  # ✅ use .first()
+        lead = result.scalars().first()
 
     if not lead:
         # Create new lead
@@ -379,14 +379,24 @@ async def receive_webhook(
 
             # ---------- Rule/AI reply handling ----------
             if conv.reply_mode == 'rule':
-                # ✅ Pass from_number as customer_phone (fourth argument)
-                reply, _ = await get_rule_reply(str(org_id), str(conv.id), content, from_number)
+                # Get rule reply and the updated conversation state
+                reply, updated_state = await get_rule_reply(str(org_id), str(conv.id), content, from_number)
+                
+                # ✅ CRITICAL FIX: Persist the updated state (including interactive_map) after every rule processing
+                if updated_state:
+                    await db.execute(
+                        update(Conversation)
+                        .where(Conversation.id == conv.id)
+                        .values(rule_state=updated_state)
+                    )
+                    await db.commit()
+                
                 if reply == "__INTERACTIVE__":
-                    # Interactive message sent; stay in rule mode – no further action
+                    # Interactive message already sent; state already saved above
                     return {"status": "ok"}
 
                 if reply:
-                    # 1. Send the rule reply immediately
+                    # Send the rule reply immediately
                     success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=str(org_id))
                     if success:
                         now_utc = datetime.now(timezone.utc)
@@ -411,18 +421,16 @@ async def receive_webhook(
                         await db.commit()
                         logger.info(f"Rule-based reply sent to {from_number}")
 
-                    # 2. LEAD CAPTURE in rule mode (silent, does not affect the reply)
+                    # LEAD CAPTURE in rule mode (silent, does not affect the reply)
                     try:
-                        # Fetch the active lead schema for this organisation
                         schema_result = await db.execute(
                             select(LeadSchema)
                             .where(LeadSchema.organization_id == org_id, LeadSchema.is_active == True)
                             .order_by(LeadSchema.updated_at.desc())
                         )
-                        lead_schema = schema_result.scalars().first() 
+                        lead_schema = schema_result.scalars().first()
 
                         if lead_schema:
-                            # Get last 5 messages of the conversation as history
                             msg_result = await db.execute(
                                 select(Message)
                                 .where(Message.conversation_id == conv.id)
@@ -434,11 +442,9 @@ async def receive_webhook(
                                 {"role": "assistant" if msg.direction == "outbound" else "customer", "text": msg.content or ""}
                                 for msg in history_messages
                             ]
-                            # Ensure current message is included (if not already)
                             if not history or history[-1]["text"] != content:
                                 history.append({"role": "customer", "text": content})
 
-                            # Extract lead data
                             extracted_data = await extract_lead_from_conversation(
                                 history,
                                 lead_schema.schema_fields or [],
@@ -446,8 +452,7 @@ async def receive_webhook(
                             )
 
                             if extracted_data:
-                                # Create or update lead (reuses the same logic as AI mode)
-                                new_lead_id = await create_lead(
+                                await create_lead(
                                     org_id=str(org_id),
                                     customer_phone=from_number,
                                     extracted_data=extracted_data,
@@ -465,22 +470,9 @@ async def receive_webhook(
                                     lead_stage=extracted_data.get("lead_stage", "new"),
                                     rule_state=extracted_data.get("rule_state", {})
                                 )
-                                logger.info(f"Lead captured in rule mode: {new_lead_id}")
-
-                                # Optional: assign nurturing sequence if lead score is high (≥70)
-                                lead_score = extracted_data.get("lead_score", 70)
-                                if lead_score >= 70:
-                                    default_seq_id = os.getenv("DEFAULT_NURTURING_SEQUENCE_ID")
-                                    if default_seq_id:
-                                        logger.info(f"High score lead {new_lead_id} – would assign sequence {default_seq_id}")
-                            else:
-                                logger.debug("No lead data extracted from rule message")
-                        else:
-                            logger.debug(f"No active lead schema for organisation {org_id} – skipping lead capture")
-
+                                logger.info(f"Lead captured in rule mode")
                     except Exception as e:
                         logger.error(f"Lead capture in rule mode failed: {e}", exc_info=True)
-                        # Do not propagate – rule reply already sent
 
                     return {"status": "ok"}
                 else:
@@ -493,7 +485,7 @@ async def receive_webhook(
                 logger.info(f"Conversation {conv.id} in human mode – skipping AI reply")
                 return {"status": "ok"}
             else:
-                # ---------- Use Feature Flag to choose processor ----------
+                # Use Feature Flag to choose processor
                 if USE_ORCHESTRATION:
                     logger.info(f"Using ORCHESTRATED processor for {from_number}")
                     background_tasks.add_task(

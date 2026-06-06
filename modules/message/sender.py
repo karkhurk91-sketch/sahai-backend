@@ -25,6 +25,14 @@ async def send_whatsapp_interactive(
         logger.error(f"No WhatsApp config for org {org_id}")
         return False, None
 
+    # ----- FIX: Ensure button body is an object with 'text' -----
+    if interactive_data.get('type') == 'button' and 'body' in interactive_data:
+        body = interactive_data['body']
+        if isinstance(body, str):
+            interactive_data['body'] = {'text': body}
+            logger.debug(f"Converted button body string to object: {body[:50]}...")
+    # For list messages, body can remain a string (API accepts it)
+
     url = f"https://graph.facebook.com/v21.0/{config['phone_number_id']}/messages"
     headers = {
         "Authorization": f"Bearer {config['access_token']}",
@@ -38,16 +46,33 @@ async def send_whatsapp_interactive(
         "interactive": interactive_data
     }
 
+    # Log the payload for debugging (remove in production if sensitive)
+    logger.debug(f"Sending interactive payload: {json.dumps(payload, indent=2)}")
+
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(url, headers=headers, json=payload)
-            response.raise_for_status()
+            if response.status_code != 200:
+                # Log the full error response from WhatsApp
+                error_body = response.text
+                logger.error(f"WhatsApp API error {response.status_code}: {error_body}")
+                response.raise_for_status()
             data = response.json()
             wamid = data.get("messages", [{}])[0].get("id")
             logger.info(f"Interactive message sent to {to_number}, wamid={wamid}")
             return True, wamid
+        except httpx.HTTPStatusError as e:
+            # Try to get more details from response
+            error_detail = ""
+            if e.response is not None:
+                try:
+                    error_detail = e.response.text
+                except:
+                    pass
+            logger.error(f"Failed to send interactive message: {e} | Detail: {error_detail}")
+            return False, None
         except Exception as e:
-            logger.error(f"Failed to send interactive message: {e}")
+            logger.error(f"Unexpected error sending interactive message: {e}", exc_info=True)
             return False, None
 
 
