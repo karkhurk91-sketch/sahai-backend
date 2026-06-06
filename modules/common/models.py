@@ -58,6 +58,18 @@ class Organization(Base):
     sla_minutes = Column(Integer, default=60)
 
 
+class OrganizationConversationFlow(Base):
+    __tablename__ = "organization_conversation_flows"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    flow_type = Column(String(50), nullable=False, default="buyer")
+    is_active = Column(Boolean, default=True)
+    steps = Column(JSON, default=[])
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    __table_args__ = (UniqueConstraint("organization_id", "flow_type"),)
+
+
 class Customer(Base):
     __tablename__ = "customers"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

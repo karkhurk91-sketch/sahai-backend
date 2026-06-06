@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, text
 from modules.common.database import get_db
-from modules.common.models import Organization, User, OrganizationChannel
+from modules.common.models import Organization, User, OrganizationChannel, OrganizationConversationFlow
 from modules.auth.jwt import get_current_user, hash_password, verify_password
 from modules.common.masking import MaskingConfig
+from modules.interactive.config_loader import get_default_conversation_flow
 from pydantic import BaseModel
 from uuid import UUID
 from typing import Optional, List
@@ -54,6 +55,112 @@ async def get_organization(org_id: UUID, db: AsyncSession = Depends(get_db)):
     if not org:
         raise HTTPException(404, "Organization not found")
     return org
+
+# ---------- Conversation flow configuration endpoints ----------
+class ConversationFlowStep(BaseModel):
+    action: str | dict
+    interactive_action: Optional[dict] = None
+    field: str
+    prompt: Optional[str] = None
+    type: Optional[str] = "text"
+    required: bool = True
+    options: Optional[list] = None
+    value_map: Optional[dict] = None
+
+class OrganizationConversationFlowUpdate(BaseModel):
+    flow_type: str = "buyer"
+    steps: list[ConversationFlowStep]
+    is_active: bool = True
+
+@router.get("/{org_id}/conversation-flows/{flow_type}")
+async def get_conversation_flow(
+    org_id: UUID,
+    flow_type: str,
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if current_user.get("role") not in ["org_admin", "super_admin", "partner"]:
+        raise HTTPException(403, "Only organization admins can view conversation flows")
+    if current_user.get("org_id") != org_id and current_user.get("role") != "super_admin":
+        raise HTTPException(403, "Access denied")
+
+    org_result = await db.execute(select(Organization).where(Organization.id == org_id))
+    org = org_result.scalar_one_or_none()
+    if not org:
+        raise HTTPException(404, "Organization not found")
+    industry = (org.business_type or "realestate").lower()
+
+    result = await db.execute(
+        select(OrganizationConversationFlow).where(
+            OrganizationConversationFlow.organization_id == org_id,
+            OrganizationConversationFlow.flow_type == flow_type,
+            OrganizationConversationFlow.is_active == True,
+        )
+    )
+    flow = result.scalar_one_or_none()
+    if flow:
+        return {
+            "flow_type": flow.flow_type,
+            "steps": flow.steps,
+            "is_active": flow.is_active,
+            "created_at": flow.created_at,
+            "updated_at": flow.updated_at,
+        }
+
+    default_steps = get_default_conversation_flow(industry, flow_type)
+    if default_steps:
+        return {
+            "flow_type": flow_type,
+            "steps": default_steps,
+            "is_active": False,
+            "created_at": None,
+            "updated_at": None,
+            "source": "default",
+        }
+
+    raise HTTPException(404, "Conversation flow not found")
+
+@router.put("/{org_id}/conversation-flows/{flow_type}")
+async def update_conversation_flow(
+    org_id: UUID,
+    flow_type: str,
+    flow_update: OrganizationConversationFlowUpdate,
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if current_user.get("role") not in ["org_admin", "super_admin", "partner"]:
+        raise HTTPException(403, "Only organization admins can manage conversation flows")
+    if current_user.get("org_id") != org_id and current_user.get("role") != "super_admin":
+        raise HTTPException(403, "Access denied")
+
+    result = await db.execute(
+        select(OrganizationConversationFlow).where(
+            OrganizationConversationFlow.organization_id == org_id,
+            OrganizationConversationFlow.flow_type == flow_type,
+        )
+    )
+    flow = result.scalar_one_or_none()
+    if not flow:
+        flow = OrganizationConversationFlow(
+            organization_id=org_id,
+            flow_type=flow_type,
+            steps=[step.dict() for step in flow_update.steps],
+            is_active=flow_update.is_active,
+        )
+        db.add(flow)
+    else:
+        flow.steps = [step.dict() for step in flow_update.steps]
+        flow.is_active = flow_update.is_active
+
+    await db.commit()
+    await db.refresh(flow)
+    return {
+        "flow_type": flow.flow_type,
+        "steps": flow.steps,
+        "is_active": flow.is_active,
+        "created_at": flow.created_at,
+        "updated_at": flow.updated_at,
+    }
 
 # ---------- New Profile & Password endpoints ----------
 class ProfileUpdate(BaseModel):

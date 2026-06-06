@@ -4,8 +4,10 @@ import importlib
 from sqlalchemy import text
 from modules.common.database import AsyncSessionLocal
 from modules.common.models import Conversation
+from modules.ai.flow_service import get_org_conversation_flow
 from modules.ai.lead_capture import create_lead
 from modules.common.logger import get_logger
+from modules.interactive.config_loader import get_default_conversation_flow
 
 logger = get_logger(__name__)
 
@@ -54,7 +56,20 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str, cus
             for k, v in state_json.items():
                 setattr(state, k, v)
 
-    # 5. Run rules engine
+    # 5. Load per-organization conversation flow if configured
+    org_flow = await get_org_conversation_flow(org_id, flow_type="buyer")
+    if org_flow:
+        state.flow_steps = org_flow
+        state.flow_type = "buyer"
+        state.flow_source = "db"
+    else:
+        default_flow = get_default_conversation_flow(industry, flow_type="buyer")
+        if default_flow:
+            state.flow_steps = default_flow
+            state.flow_type = "buyer"
+            state.flow_source = "default"
+
+    # 6. Run rules engine
     rules_engine = mod.RulesEngine()
     # If the state already has an interactive map, give it to the engine
     if hasattr(state, 'interactive_map') and state.interactive_map:

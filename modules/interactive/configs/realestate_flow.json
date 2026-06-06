@@ -1,0 +1,106 @@
+{
+  "flow_type": "buyer",
+  "steps": [
+    {
+      "field": "name",
+      "action": "ask_name",
+      "prompt": "May I know your name?",
+      "type": "text",
+      "required": true
+    },
+    {
+      "field": "budget",
+      "action": "ask_budget",
+      "prompt": "What is your budget range?",
+      "type": "button",
+      "required": true,
+      "options": [
+        {"id": "budget_less_20", "title": "< ₹20L", "value": "< ₹20L"},
+        {"id": "budget_20_50", "title": "₹20–50L", "value": "₹20–50L"},
+        {"id": "budget_more_50", "title": "> ₹50L", "value": "> ₹50L"}
+      ],
+      "value_map": {
+        "budget_less_20": ["budget", "< ₹20L"],
+        "budget_20_50": ["budget", "₹20–50L"],
+        "budget_more_50": ["budget", "> ₹50L"]
+      }
+    },
+    {
+      "field": "location",
+      "action": "ask_location",
+      "prompt": "Choose one from the list.",
+      "type": "list",
+      "required": true,
+      "header": "Select preferred location",
+      "body": "Choose one from the list",
+      "footer": "Indore properties",
+      "interactive_action": {
+        "button": "View locations",
+        "sections": [
+          {
+            "title": "Popular Areas",
+            "rows": [
+              {"id": "loc_rajendra", "title": "Rajendra Nagar"},
+              {"id": "loc_vijay", "title": "Vijay Nagar"},
+              {"id": "loc_scheme78", "title": "Scheme No. 78"}
+            ]
+          }
+        ]
+      },
+      "value_map": {
+        "loc_rajendra": ["location", "Rajendra Nagar"],
+        "loc_vijay": ["location", "Vijay Nagar"],
+        "loc_scheme78": ["location", "Scheme No. 78"]
+      }
+    },
+    {
+      "field": "bhk",
+      "action": "ask_bhk",
+      "prompt": "How many bedrooms do you need?",
+      "type": "button",
+      "required": true,
+      "options": [
+        {"id": "bhk_1", "title": "1 BHK", "value": "1 BHK"},
+        {"id": "bhk_2", "title": "2 BHK", "value": "2 BHK"},
+        {"id": "bhk_3", "title": "3 BHK", "value": "3 BHK"}
+      ],
+      "value_map": {
+        "bhk_1": ["bhk", "1 BHK"],
+        "bhk_2": ["bhk", "2 BHK"],
+        "bhk_3": ["bhk", "3 BHK"]
+      }
+    },
+    {
+      "field": "possession",
+      "action": "ask_possession",
+      "prompt": "When would you like to move in?",
+      "type": "button",
+      "required": true,
+      "options": [
+        {"id": "possession_immediate", "title": "Immediate", "value": "immediate"},
+        {"id": "possession_1_2", "title": "1-2 months", "value": "1-2 months"},
+        {"id": "possession_3_6", "title": "3-6+ months", "value": "3-6+ months"}
+      ],
+      "value_map": {
+        "possession_immediate": ["possession", "immediate"],
+        "possession_1_2": ["possession", "1-2 months"],
+        "possession_3_6": ["possession", "3-6+ months"]
+      }
+    },
+    {
+      "field": "confirm",
+      "action": "ask_confirmation",
+      "prompt": "Please confirm your details:",
+      "type": "button",
+      "required": false,
+      "options": [
+        {"id": "confirm_yes", "title": "Confirm", "value": true},
+        {"id": "confirm_no", "title": "Change", "value": false}
+      ],
+      "value_map": {
+        "confirm_yes": ["confirm", true],
+        "confirm_no": ["confirm", false]
+      }
+    }
+  ]
+}

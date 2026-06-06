@@ -50,6 +50,17 @@ class RulesEngine:
         "reason": r"(job|relocation|transfer|upgrade|bigger|family|investment|rental income|परिवार|नौकरी)",
     }
 
+    DEFAULT_FLOW = [
+        {"field": "name", "action": "ask_name", "required": True},
+        {"field": "budget", "action": "ask_budget", "required": True},
+        {"field": "location", "action": "ask_location", "required": True},
+        {"field": "bhk", "action": "ask_bhk", "required": True},
+        {"field": "possession", "action": "ask_possession", "required": True},
+        {"field": "loan_status", "action": "ask_loan", "required": False},
+        {"field": "is_decision_maker", "action": "ask_decision_maker", "required": False},
+        {"field": "reason", "action": "ask_reason", "required": False},
+    ]
+
     def __init__(self):
         self.compiled_extractors = {k: re.compile(v, re.IGNORECASE) for k, v in self.EXTRACTORS.items()}
         # Mapping of interactive button/list IDs to (field, value)
@@ -58,6 +69,62 @@ class RulesEngine:
     def set_id_value_map(self, id_map: dict):
         """Called by rule_processor to inject value_map from interactive config."""
         self.id_value_map = id_map
+
+    def _get_flow_steps(self, state):
+        if hasattr(state, "flow_steps") and state.flow_steps:
+            return state.flow_steps
+        return self.DEFAULT_FLOW
+
+    def _field_has_value(self, state, field):
+        if not field:
+            return True
+        if field == "budget":
+            return getattr(state, "budget_amount", None) is not None
+        if field == "phone":
+            return bool(getattr(state, "phone", None))
+        if field == "name":
+            return bool(getattr(state, "name", None))
+        if field == "location":
+            return bool(getattr(state, "location", None))
+        if field == "bhk":
+            return bool(getattr(state, "bhk", None))
+        if field == "possession":
+            return bool(getattr(state, "possession", None))
+        if field == "loan_status":
+            return bool(getattr(state, "loan_status", None))
+        if field == "is_decision_maker":
+            return getattr(state, "is_decision_maker", None) is not None
+        if field == "reason":
+            return bool(getattr(state, "reason", None))
+        return bool(getattr(state, field, None))
+
+    def _get_next_missing_lead_step(self, state):
+        for step in self._get_flow_steps(state):
+            if not step.get("required", True):
+                continue
+            field = step.get("field")
+            if not field or self._field_has_value(state, field):
+                continue
+            return step
+        return None
+
+    def _get_missing_lead_fields(self, state):
+        missing = []
+        for step in self._get_flow_steps(state):
+            if not step.get("required", True):
+                continue
+            field = step.get("field")
+            if not field:
+                continue
+            if not self._field_has_value(state, field):
+                missing.append(field)
+        return missing
+
+    def _get_action_for_field(self, state, field):
+        for step in self._get_flow_steps(state):
+            if step.get("field") == field:
+                return step.get("action", f"ask_{field}")
+        return f"ask_{field}"
 
     def _redact_value(self, field: str, value: str) -> str:
         if field == "phone" and value:
@@ -339,66 +406,39 @@ class RulesEngine:
         if not state.pending_correction_field:
             self.extract_fields(user_input, state)
 
-        # ----- QUALIFICATION STAGE (with enhanced protection) -----
+        # ----- QUALIFICATION STAGE (with enhanced flow support) -----
         if state.stage == "qualification":
-            # If we are already waiting for a field, just keep asking that field.
             if state.awaiting_field:
-                # Do not ask budget again if it was already confirmed
                 if state.awaiting_field == "budget" and (state.budget_amount is not None or getattr(state, "budget_confirmed", False)):
-                    # Budget already collected – clear waiting flag and recalc
                     state.awaiting_field = None
-                    missing_lead = self._get_missing_lead_fields(state)
-                    if missing_lead:
-                        next_field = missing_lead[0]
-                        state.awaiting_field = next_field
-                        return {"action": f"ask_{next_field}", "data": {}}
-                    else:
-                        # All fields collected, move to confirmation
-                        state.stage = "confirmation"
-                        state.confirmation_pending = True
-                        state.awaiting_field = None
-                        state.calculate_bant_score()
-                        state.pending_summary = {
-                            "name": state.name,
-                            "phone": state.phone,
-                            "budget": state.budget,
-                            "location": state.location,
-                            "bhk": state.bhk,
-                            "possession": state.possession,
-                            "loan_status": state.loan_status,
-                            "is_decision_maker": state.is_decision_maker,
-                            "reason": state.reason,
-                            "lead_tag": state.lead_tag,
-                        }
-                        logger.info("Confirmation started; summary prepared")
-                        return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
-                return {"action": f"ask_{state.awaiting_field}", "data": {}}
+                else:
+                    action = self._get_action_for_field(state, state.awaiting_field)
+                    return {"action": action, "data": {}}
 
-            missing_lead = self._get_missing_lead_fields(state)
-            if missing_lead:
-                next_field = missing_lead[0]
-                state.awaiting_field = next_field
-                return {"action": f"ask_{next_field}", "data": {}}
-            else:
-                # All lead fields collected → move to confirmation
-                state.stage = "confirmation"
-                state.confirmation_pending = True
-                state.awaiting_field = None
-                state.calculate_bant_score()
-                state.pending_summary = {
-                    "name": state.name,
-                    "phone": state.phone,
-                    "budget": state.budget,
-                    "location": state.location,
-                    "bhk": state.bhk,
-                    "possession": state.possession,
-                    "loan_status": state.loan_status,
-                    "is_decision_maker": state.is_decision_maker,
-                    "reason": state.reason,
-                    "lead_tag": state.lead_tag,
-                }
-                logger.info("Confirmation started; summary prepared")
-                return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
+            next_step = self._get_next_missing_lead_step(state)
+            if next_step:
+                state.awaiting_field = next_step.get("field")
+                return {"action": next_step.get("action", f"ask_{state.awaiting_field}"), "data": {}}
+
+            # All required lead fields collected → move to confirmation
+            state.stage = "confirmation"
+            state.confirmation_pending = True
+            state.awaiting_field = None
+            state.calculate_bant_score()
+            state.pending_summary = {
+                "name": state.name,
+                "phone": state.phone,
+                "budget": state.budget,
+                "location": state.location,
+                "bhk": state.bhk,
+                "possession": state.possession,
+                "loan_status": state.loan_status,
+                "is_decision_maker": state.is_decision_maker,
+                "reason": state.reason,
+                "lead_tag": state.lead_tag,
+            }
+            logger.info("Confirmation started; summary prepared")
+            return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
 
         # ----- CORRECTION HANDLING -----
         if intent == "correction":

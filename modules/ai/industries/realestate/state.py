@@ -24,6 +24,11 @@ class State:
         self.stage = "greeting"
         self.last_intent = None
 
+        # Organization-specific flow configuration
+        self.flow_type = "buyer"
+        self.flow_steps = []
+        self.flow_source = None
+
         # Confirmation & correction
         self.confirmation_pending = False
         self.pending_summary = {}
