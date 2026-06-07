@@ -2,7 +2,7 @@ import asyncio
 import json
 import httpx
 from uuid import UUID
-from typing import Optional, Tuple, Dict, Any   # added Dict, Any
+from typing import Optional, Tuple, Dict, Any
 from sqlalchemy import text
 from modules.common.logger import get_logger
 from modules.common.database import sync_engine
@@ -25,14 +25,33 @@ async def send_whatsapp_interactive(
         logger.error(f"No WhatsApp config for org {org_id}")
         return False, None
 
-    # ----- FIX: Ensure button body is an object with 'text' -----
+    # ----- FIX 1: Ensure button body is an object with 'text' -----
     if interactive_data.get('type') == 'button' and 'body' in interactive_data:
         body = interactive_data['body']
         if isinstance(body, str):
             interactive_data['body'] = {'text': body}
             logger.debug(f"Converted button body string to object: {body[:50]}...")
-    # For list messages, body can remain a string (API accepts it)
 
+    # ----- FIX 2: Ensure interactive.action is an object (for button messages) -----
+    if interactive_data.get('type') == 'button' and 'action' in interactive_data:
+        action = interactive_data['action']
+        if isinstance(action, list):
+            # The configuration provided a list of buttons directly.
+            # Wrap it as required by the API.
+            interactive_data['action'] = {'buttons': action}
+            logger.debug("Fixed button action: wrapped list in {'buttons': ...}")
+        elif isinstance(action, dict) and 'buttons' not in action:
+            # If action is a dict but missing 'buttons', log a warning.
+            logger.warning(f"Button action missing 'buttons' key: {action}")
+
+    # For list messages, ensure action is an object with required keys (optional)
+    if interactive_data.get('type') == 'list' and 'action' in interactive_data:
+        action = interactive_data['action']
+        if not isinstance(action, dict):
+            logger.error(f"List action is not a dict: {action}")
+            # Attempt to fix: if it's a list? unlikely, just log and continue
+
+    interactive_data = _validate_interactive_payload(interactive_data)
     url = f"https://graph.facebook.com/v21.0/{config['phone_number_id']}/messages"
     headers = {
         "Authorization": f"Bearer {config['access_token']}",
@@ -46,14 +65,12 @@ async def send_whatsapp_interactive(
         "interactive": interactive_data
     }
 
-    # Log the payload for debugging (remove in production if sensitive)
     logger.debug(f"Sending interactive payload: {json.dumps(payload, indent=2)}")
 
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(url, headers=headers, json=payload)
             if response.status_code != 200:
-                # Log the full error response from WhatsApp
                 error_body = response.text
                 logger.error(f"WhatsApp API error {response.status_code}: {error_body}")
                 response.raise_for_status()
@@ -62,7 +79,6 @@ async def send_whatsapp_interactive(
             logger.info(f"Interactive message sent to {to_number}, wamid={wamid}")
             return True, wamid
         except httpx.HTTPStatusError as e:
-            # Try to get more details from response
             error_detail = ""
             if e.response is not None:
                 try:
@@ -154,7 +170,6 @@ class WhatsAppService:
             return response.json()
 
     async def upload_media(self, filename: str, mime_type: str, file_bytes: bytes) -> str:
-        # Ensure filename is a string (not bytes)
         if isinstance(filename, bytes):
             filename = filename.decode('utf-8')
         filename = str(filename)
@@ -213,7 +228,7 @@ class WhatsAppService:
             logger.error(f"Failed to send media message: {e}")
             return False, None
 
-    async def send_template_message(self, to_number: str, template_name: str, language_code: str, components: list = None) -> tuple[bool, Optional[str]]:
+    async def send_template_message(self, to_number: str, template_name: str, language_code: str, components: list = None, category: str = None, org_id: str = None) -> tuple[bool, Optional[str]]:
         payload = {
             "messaging_product": "whatsapp",
             "to": to_number,
@@ -267,3 +282,24 @@ async def send_whatsapp_text(to_number: str, text: str, org_id: str = None) -> T
         return False, None
     service = WhatsAppService(config["access_token"], config["phone_number_id"])
     return await service.send_text_message(to_number, text)
+
+def _validate_interactive_payload(interactive_data: Dict) -> Dict:
+    """Ensure interactive payload meets WhatsApp API requirements."""
+    if interactive_data.get('type') == 'button':
+        # Ensure action has buttons
+        if 'action' not in interactive_data:
+            interactive_data['action'] = {}
+        if 'buttons' not in interactive_data['action']:
+            logger.warning("Missing 'buttons' in action – adding empty list fallback")
+            interactive_data['action']['buttons'] = []
+        # Ensure each button has required fields
+        for btn in interactive_data['action']['buttons']:
+            if 'type' not in btn:
+                btn['type'] = 'reply'
+            if 'reply' not in btn:
+                btn['reply'] = {}
+            if 'id' not in btn['reply']:
+                btn['reply']['id'] = str(uuid.uuid4())
+            if 'title' not in btn['reply']:
+                btn['reply']['title'] = "Option"
+    return interactive_data

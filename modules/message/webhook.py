@@ -396,8 +396,23 @@ async def receive_webhook(
                     return {"status": "ok"}
 
                 if reply:
-                    # Send the rule reply immediately
-                    success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=str(org_id))
+                    # Prevent rapid duplicate outbound replies: check last outbound message
+                    last_out_stmt = select(Message).where(
+                        Message.conversation_id == conv.id,
+                        Message.direction == "outbound"
+                    ).order_by(Message.sort_timestamp.desc()).limit(1)
+                    last_out = (await db.execute(last_out_stmt)).scalar_one_or_none()
+                    send_reply = True
+                    if last_out and last_out.content == reply:
+                        # If the last outbound message is identical and was sent very recently, skip
+                        delta = datetime.now(timezone.utc) - last_out.created_at
+                        if delta.total_seconds() < 5:
+                            logger.info(f"Skipping duplicate outbound reply to {from_number}")
+                            send_reply = False
+
+                    if send_reply:
+                        # Send the rule reply immediately
+                        success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=str(org_id))
                     if success:
                         now_utc = datetime.now(timezone.utc)
                         out_msg = Message(

@@ -28,17 +28,18 @@ class State:
         self.flow_type = "buyer"
         self.flow_steps = []
         self.flow_source = None
+        self.current_step_index = 0   # <--- ADDED: tracks current position in dynamic flow
 
         # Confirmation & correction
         self.confirmation_pending = False
         self.pending_summary = {}
         self.pending_correction_field = None
         self.awaiting_field = None
+        self.previous_lead_summary = None
 
         self.budget_confirmed = False
 
-        self.interactive_map = {} 
-
+        self.interactive_map = {}
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}

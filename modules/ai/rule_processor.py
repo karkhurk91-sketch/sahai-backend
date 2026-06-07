@@ -56,18 +56,20 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str, cus
             for k, v in state_json.items():
                 setattr(state, k, v)
 
-    # 5. Load per-organization conversation flow if configured
-    org_flow = await get_org_conversation_flow(org_id, flow_type="buyer")
-    if org_flow:
-        state.flow_steps = org_flow
-        state.flow_type = "buyer"
-        state.flow_source = "db"
-    else:
-        default_flow = get_default_conversation_flow(industry, flow_type="buyer")
-        if default_flow:
-            state.flow_steps = default_flow
+    # 5. Load per-organization conversation flow if not already present in state
+    # (Avoid reloading if the state already has a flow, e.g., from a previous message)
+    if not hasattr(state, 'flow_steps') or not state.flow_steps:
+        org_flow = await get_org_conversation_flow(org_id, flow_type="buyer")
+        if org_flow:
+            state.flow_steps = org_flow
             state.flow_type = "buyer"
-            state.flow_source = "default"
+            state.flow_source = "db"
+        else:
+            default_flow = get_default_conversation_flow(industry, flow_type="buyer")
+            if default_flow:
+                state.flow_steps = default_flow
+                state.flow_type = "buyer"
+                state.flow_source = "default"
 
     # 6. Run rules engine
     rules_engine = mod.RulesEngine()
@@ -84,11 +86,11 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str, cus
         logger.error(f"Rules engine error: {e}")
         return None, None
 
-    # 6. Get static reply from prompts (pass state for dynamic replies)
+    # 7. Get static reply from prompts (pass state for dynamic replies)
     prompts = mod.Prompts(org_id)
     reply = prompts.get_rule_reply(action, action_data.get("data", {}), state=state)
 
-    # 7. Save updated state back to conversation (MUST be done before returning)
+    # 8. Save updated state back to conversation (MUST be done before returning)
     new_state_dict = state.to_dict() if hasattr(state, 'to_dict') else state.__dict__
     async with AsyncSessionLocal() as db:
         await db.execute(
@@ -97,7 +99,7 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str, cus
         )
         await db.commit()
 
-    # ----- NEW: Handle interactive replies -----
+    # ----- Handle interactive replies -----
     if isinstance(reply, dict) and reply.get("type") == "interactive":
         interactive_data = reply.get("interactive")
         value_map = reply.get("value_map", {})
@@ -105,7 +107,6 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str, cus
         state.interactive_map = value_map
         rules_engine.id_value_map = value_map
         # Also save the map into the conversation state (will be persisted on next message)
-        # We need to update the state again to include the map
         updated_state_dict = state.to_dict() if hasattr(state, 'to_dict') else state.__dict__
         async with AsyncSessionLocal() as db:
             await db.execute(
@@ -128,7 +129,7 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str, cus
         logger.info(f"No rule reply for action {action} (org {org_id})")
         return None, new_state_dict
 
-    # 8. Handle lead creation for different actions
+    # 9. Handle lead creation for different actions
     if action == "order_confirmed":
         # Restaurant order confirmation
         customer_phone_state = getattr(state, 'phone', None)
