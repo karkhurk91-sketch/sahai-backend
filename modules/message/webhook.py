@@ -413,6 +413,9 @@ async def receive_webhook(
                     if send_reply:
                         # Send the rule reply immediately
                         success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=str(org_id))
+                    else:
+                        success = False
+                        wamid = None
                     if success:
                         now_utc = datetime.now(timezone.utc)
                         out_msg = Message(

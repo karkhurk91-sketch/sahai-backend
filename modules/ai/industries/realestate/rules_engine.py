@@ -525,6 +525,7 @@ class RulesEngine:
                 return {"action": "lead_complete", "data": state.pending_summary}
             if intent == "confirm_no" or intent == "correction":
                 state.confirmation_pending = False
+                state.stage = "confirmation"  # Keep in confirmation to enable correction flow
                 state.awaiting_field = None
                 logger.info("Confirmation rejected; requesting correction")
                 return {"action": "ask_which_field_to_correct", "data": {}}
@@ -575,6 +576,7 @@ class RulesEngine:
             logger.info(f"Field correction started for {field}")
             return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
 
+        # ----- FIELD CORRECTION FROM CONFIRMATION STAGE -----
         if state.stage == "confirmation" and not state.confirmation_pending and not state.pending_correction_field:
             field = self._extract_field_to_correct(user_input, state)
             if field:
@@ -582,6 +584,8 @@ class RulesEngine:
                 state.awaiting_field = field
                 logger.info(f"Field correction started for {field}")
                 return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
+            # If no field extracted, ask user to specify
+            return {"action": "ask_which_field_to_correct", "data": {}}
 
         # ----- DIRECT INTENT HANDLING -----
         if intent == "site_visit":
@@ -690,8 +694,8 @@ class RulesEngine:
             logger.info("Confirmation started; summary prepared")
             return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
 
-        # ----- CORRECTION HANDLING -----
-        if intent == "correction":
+        # ----- CORRECTION HANDLING (for stage != confirmation) -----
+        if state.stage != "confirmation" and intent == "correction":
             field = self._extract_field_to_correct(user_input, state)
             if field:
                 state.pending_correction_field = field
