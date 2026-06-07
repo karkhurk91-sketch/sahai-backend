@@ -217,7 +217,7 @@ class Prompts:
 
         # Plain text replies (hardcoded)
         if action == "greeting":
-            return "Hello! I'm your real estate assistant. Are you looking to buy a property?"
+            return "Hello! I'm your real estate assistant. Are you looking to a property?"
         if action == "ask_name":
             return "May I know your name?"
         if action == "ask_phone":

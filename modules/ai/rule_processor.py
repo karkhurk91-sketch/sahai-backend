@@ -158,7 +158,9 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str, cus
     elif action == "lead_complete":
         # Real estate lead completion (all fields collected)
         lead_data = action_data.get("data", {})
-        # Fallback to state attributes if not in action_data
+        if not isinstance(lead_data, dict):
+            lead_data = {}
+        # Fallback to state attributes if not provided in action_data
         phone = lead_data.get("phone") or getattr(state, 'phone', None)
         name = lead_data.get("name") or getattr(state, 'name', '')
         budget = lead_data.get("budget") or getattr(state, 'budget', '')
@@ -166,19 +168,29 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str, cus
         bhk = lead_data.get("bhk") or getattr(state, 'bhk', '')
         lead_tag = getattr(state, 'lead_tag', None)
         lead_score = getattr(state, 'bant_score', 70)
+
+        extracted_data = {
+            "name": name,
+            "phone": phone,
+            "budget": budget,
+            "location": location,
+            "bhk": bhk,
+            "lead_tag": lead_tag,
+        }
+        # Preserve custom dynamic fields from the flow
+        for step in getattr(state, 'flow_steps', []) or []:
+            field = step.get('field')
+            if field and field not in extracted_data:
+                extracted_data[field] = getattr(state, field, None)
+        # Preserve any explicit fields from action_data
+        extracted_data.update({k: v for k, v in lead_data.items() if k not in extracted_data or extracted_data.get(k) is None})
+
         if phone:
             await create_lead(
                 org_id=org_id,
                 customer_phone=phone,
                 customer_name=name,
-                extracted_data={
-                    "name": name,
-                    "phone": phone,
-                    "budget": budget,
-                    "location": location,
-                    "bhk": bhk,
-                    "lead_tag": lead_tag,
-                },
+                extracted_data=extracted_data,
                 lead_score=lead_score,
                 interest=f"{bhk} BHK in {location}",
                 service="real_estate",

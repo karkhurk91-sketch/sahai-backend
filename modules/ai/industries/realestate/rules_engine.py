@@ -91,37 +91,44 @@ class RulesEngine:
 
     def _get_current_step(self, state):
         """
-        Return the step that the user is currently on (the first missing required step).
+        Return the step that the user is currently on.
         Iterates over flow steps in order and returns the first step whose field is missing.
-        This is the core of the dynamic flow.
+        Optional steps are still considered part of the flow so custom flows execute in order.
         """
         steps = self._get_flow_steps(state)
         if not steps:
             return None
         for step in steps:
-            # Only consider required steps (optional steps are skipped)
-            if not step.get("required", True):
-                continue
             field = step.get("field")
-            if not field:
-                # Steps without a field (e.g., confirmation) are considered always pending
-                return step
-            if not self._field_has_value(state, field):
-                return step
+            if field and self._field_has_value(state, field):
+                continue
+            return step
         return None  # All steps completed
 
     def _get_next_missing_lead_step(self, state):
-        """Legacy method – kept for compatibility, but not used in dynamic flow."""
-        flow_steps = self._get_flow_steps(state)
-        if not flow_steps:
+        """Return the next step in the current dynamic flow that still needs a value."""
+        return self._get_current_step(state)
+
+    def _dynamic_confirmation_step(self, state):
+        """Return the confirmation step from a custom flow, if configured."""
+        for step in self._get_flow_steps(state) or []:
+            if step.get("action") == "ask_confirmation" or step.get("field") == "confirm":
+                return step
+        return None
+
+    def _confirm_value(self, state):
+        """Normalize any confirmation field value to True/False if present."""
+        if not hasattr(state, "confirm"):
             return None
-        for step in flow_steps:
-            if not step.get("required", True):
-                continue
-            field = step.get("field")
-            if not field or self._field_has_value(state, field):
-                continue
-            return step
+        value = getattr(state, "confirm")
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in ["yes", "y", "true", "confirm", "haan", "हाँ", "sure", "ok"]:
+                return True
+            if normalized in ["no", "n", "false", "change", "nah", "nahi", "नहीं", "cancel"]:
+                return False
         return None
 
     def _get_action_for_field(self, state, field):
@@ -205,7 +212,7 @@ class RulesEngine:
 
     def _get_first_missing_step_action(self, state):
         if self._has_dynamic_flow(state):
-            next_step = self._get_next_missing_lead_step(state)
+            next_step = self._get_current_step(state)
             if next_step:
                 return next_step.get("action", f"ask_{next_step.get('field')}")
         missing_lead = self._get_missing_lead_fields(state)
@@ -617,9 +624,27 @@ class RulesEngine:
                 logger.info(f"Next step: {action} (field={field})")
                 return {"action": action, "data": {}}
 
-            # If dynamic flow is available and all required fields are captured,
-            # transition directly to confirmation without hardcoded fallback.
+            # If a dynamic flow includes an explicit confirmation step and the user has already answered it,
+            # complete the lead immediately rather than re-asking confirmation.
             if self._has_dynamic_flow(state):
+                confirm_step = self._dynamic_confirmation_step(state)
+                confirm_value = self._confirm_value(state)
+                if confirm_step is not None and confirm_value is not None:
+                    if confirm_value:
+                        state.confirmation_pending = False
+                        state.stage = "recommendation"
+                        state.awaiting_field = None
+                        state.calculate_bant_score()
+                        state.pending_summary = self._build_summary(state)
+                        state.pending_summary["lead_tag"] = state.lead_tag
+                        self._save_current_summary(state)
+                        logger.info("Confirmation accepted; completing lead from dynamic flow")
+                        return {"action": "lead_complete", "data": state.pending_summary}
+                    state.confirmation_pending = False
+                    state.awaiting_field = None
+                    logger.info("Confirmation rejected; requesting correction from dynamic flow")
+                    return {"action": "ask_which_field_to_correct", "data": {}}
+
                 state.stage = "confirmation"
                 state.confirmation_pending = True
                 state.awaiting_field = None
