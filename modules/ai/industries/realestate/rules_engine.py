@@ -67,54 +67,53 @@ class RulesEngine:
 
     def __init__(self):
         self.compiled_extractors = {k: re.compile(v, re.IGNORECASE) for k, v in self.EXTRACTORS.items()}
-        # Mapping of interactive button/list IDs to (field, value)
         self.id_value_map = {}
 
     def set_id_value_map(self, id_map: dict):
-        """Called by rule_processor to inject value_map from interactive config."""
         self.id_value_map = id_map
 
     def _has_dynamic_flow(self, state):
-        """Check if organization has a custom dynamic flow configured."""
         return hasattr(state, "flow_steps") and state.flow_steps and len(state.flow_steps) > 0
 
     def _get_flow_steps(self, state):
-        """Return dynamic flow steps if available, otherwise None."""
-        if self._has_dynamic_flow(state):
-            return state.flow_steps
-        return None
+        return state.flow_steps if self._has_dynamic_flow(state) else None
 
     def _field_has_value(self, state, field):
-        """Check if a lead field already has a value."""
+        """Return True if field is already captured (any non-None value)."""
         if not field:
             return True
         if field == "budget":
             return getattr(state, "budget_amount", None) is not None
-        if field == "phone":
-            return bool(getattr(state, "phone", None))
-        if field == "name":
-            return bool(getattr(state, "name", None))
-        if field == "location":
-            return bool(getattr(state, "location", None))
-        if field == "bhk":
-            return bool(getattr(state, "bhk", None))
-        if field == "possession":
-            return bool(getattr(state, "possession", None))
-        if field == "loan_status":
-            return bool(getattr(state, "loan_status", None))
-        if field == "is_decision_maker":
-            return getattr(state, "is_decision_maker", None) is not None
-        if field == "reason":
-            return bool(getattr(state, "reason", None))
-        return bool(getattr(state, field, None))
+        val = getattr(state, field, None)
+        return val is not None
+
+    def _get_current_step(self, state):
+        """
+        Return the step that the user is currently on (the first missing required step).
+        Iterates over flow steps in order and returns the first step whose field is missing.
+        This is the core of the dynamic flow.
+        """
+        steps = self._get_flow_steps(state)
+        if not steps:
+            return None
+        for step in steps:
+            # Only consider required steps (optional steps are skipped)
+            if not step.get("required", True):
+                continue
+            field = step.get("field")
+            if not field:
+                # Steps without a field (e.g., confirmation) are considered always pending
+                return step
+            if not self._field_has_value(state, field):
+                return step
+        return None  # All steps completed
 
     def _get_next_missing_lead_step(self, state):
-        """Get next required step from dynamic flow (only if dynamic flow exists)."""
+        """Legacy method – kept for compatibility, but not used in dynamic flow."""
         flow_steps = self._get_flow_steps(state)
         if not flow_steps:
             return None
         for step in flow_steps:
-            # Skip optional steps if they are not required
             if not step.get("required", True):
                 continue
             field = step.get("field")
@@ -124,7 +123,6 @@ class RulesEngine:
         return None
 
     def _get_action_for_field(self, state, field):
-        """Get action name for a given field from dynamic flow (fallback to ask_{field})."""
         flow_steps = self._get_flow_steps(state)
         if flow_steps:
             for step in flow_steps:
@@ -133,14 +131,12 @@ class RulesEngine:
         return f"ask_{field}"
 
     def _get_dynamic_field_names(self, state):
-        """Return configured field names from the dynamic flow."""
         flow_steps = self._get_flow_steps(state)
         if not flow_steps:
             return []
         return [step.get("field") for step in flow_steps if step.get("field")]
 
     def _get_available_fields(self, state):
-        """Return all fields selectable for correction, including dynamic flow fields."""
         base_fields = [
             "name", "budget", "location", "bhk", "phone", "possession",
             "loan_status", "decision_maker", "reason"
@@ -327,32 +323,51 @@ class RulesEngine:
 
     def detect_intent(self, text: str) -> str:
         text_lower = text.strip().lower()
-        # First handle exact intent token matches such as interactive button IDs like confirm_no
         if text_lower in self.INTENTS:
             return text_lower
-
-        # Next handle exact keyword matches before substring matching to avoid false positives.
         for intent, keywords in self.INTENTS.items():
             for kw in keywords:
                 if text_lower == kw:
                     return intent
-
         for intent, keywords in self.INTENTS.items():
             if any(kw in text_lower for kw in keywords):
                 return intent
         return "unknown"
 
+    def _match_typed_text_to_button_option(self, text: str, state: State) -> bool:
+        if not state.awaiting_field:
+            return False
+        flow_steps = getattr(state, "flow_steps", [])
+        step = None
+        for s in flow_steps:
+            if s.get("field") == state.awaiting_field and s.get("type") == "button":
+                step = s
+                break
+        if not step:
+            return False
+        typed = text.strip().lower()
+        for opt in step.get("options", []):
+            opt_title = opt.get("title", "").lower()
+            if typed == opt_title or typed in opt_title or opt_title in typed:
+                field = step["field"]
+                value = opt.get("value", opt.get("title"))
+                setattr(state, field, value)
+                if field == "budget":
+                    state.budget_amount = self._parse_budget_amount(value)
+                    state.budget_confirmed = True
+                state.awaiting_field = None
+                logger.info(f"Matched typed answer '{text}' to button option {opt.get('id')} -> {field}={value}")
+                return True
+        return False
+
     def extract_fields(self, text: str, state: State) -> None:
         if text in self.id_value_map:
             mapping = self.id_value_map[text]
-            
             if isinstance(mapping, (tuple, list)) and len(mapping) == 2:
                 field, value = mapping
             elif isinstance(mapping, str):
-                # Use the currently awaited field
                 field = state.awaiting_field
                 if not field:
-                    # Fallback: determine the next missing field (dynamic or hardcoded)
                     if self._has_dynamic_flow(state):
                         next_step = self._get_next_missing_lead_step(state)
                         field = next_step.get("field") if next_step else "location"
@@ -364,13 +379,15 @@ class RulesEngine:
             else:
                 logger.error(f"Invalid value_map entry for {text}: {mapping}")
                 return
-            
             setattr(state, field, value)
             if field == "budget":
                 state.budget_amount = self._parse_budget_amount(value)
                 state.budget_confirmed = True
             if state.awaiting_field == field:
                 state.awaiting_field = None
+            return
+
+        if self._match_typed_text_to_button_option(text, state):
             return
 
         extracted = False
@@ -430,7 +447,6 @@ class RulesEngine:
             self._fill_awaiting_field(text, state)
 
     def _parse_budget_amount(self, budget_str: str) -> float:
-        # Enhanced to handle ranges and symbols (e.g. "< ₹20L", "₹20–50L", "> ₹50L")
         match = re.search(r'(\d+(?:\.\d+)?)', budget_str)
         if match:
             return float(match.group(1))
@@ -438,7 +454,6 @@ class RulesEngine:
 
     def _extract_field_to_correct(self, text, state=None):
         text_normalized = self._normalize_text(text)
-        # Try dynamic flow field names first
         if state is not None:
             for step in self._get_flow_steps(state) or []:
                 field = step.get("field")
@@ -449,7 +464,6 @@ class RulesEngine:
                 label = step.get("label") or step.get("title") or step.get("header")
                 if label and label.lower() in text_normalized:
                     return field
-
         if "name" in text_normalized:
             return "name"
         if "phone" in text_normalized or "mobile" in text_normalized:
@@ -465,14 +479,13 @@ class RulesEngine:
         return None
 
     def process(self, user_input: str, state: State) -> dict:
-        # CRITICAL FIX: Restore interactive map from persisted state
         if hasattr(state, 'interactive_map') and state.interactive_map:
             self.id_value_map = state.interactive_map
 
         intent = self.detect_intent(user_input)
         state.last_intent = intent
 
-        # ----- GREETING HANDLING -----
+        # ----- GREETING -----
         if state.stage == "greeting":
             if intent == "greeting":
                 state.awaiting_field = None
@@ -509,7 +522,6 @@ class RulesEngine:
             next_action = self._get_first_missing_step_action(state)
             state.awaiting_field = next_action.replace("ask_", "")
             return {"action": next_action, "data": {}}
-
         if intent == "continue" and state.stage == "recommendation":
             return {"action": "continue_search", "data": {}}
 
@@ -555,25 +567,27 @@ class RulesEngine:
         if not state.pending_correction_field:
             self.extract_fields(user_input, state)
 
-        # ----- QUALIFICATION STAGE (with dynamic flow support + fallback) -----
+        # ----- QUALIFICATION STAGE (with dynamic flow) -----
         if state.stage == "qualification":
             # If we are already waiting for a field, handle it
             if state.awaiting_field:
-                # Special case: budget already confirmed but awaiting_field still budget
-                if state.awaiting_field == "budget" and (state.budget_amount is not None or getattr(state, "budget_confirmed", False)):
+                # If the awaited field is now filled (by extraction), clear it
+                if self._field_has_value(state, state.awaiting_field):
                     state.awaiting_field = None
                 else:
                     action = self._get_action_for_field(state, state.awaiting_field)
                     return {"action": action, "data": {}}
 
-            # Try dynamic flow first
-            if self._has_dynamic_flow(state):
-                next_step = self._get_next_missing_lead_step(state)
-                if next_step:
-                    state.awaiting_field = next_step.get("field")
-                    return {"action": next_step.get("action", f"ask_{state.awaiting_field}"), "data": {}}
+            # Get the next missing step from the dynamic flow (or fallback to hardcoded)
+            next_step = self._get_current_step(state)
+            if next_step:
+                field = next_step.get("field")
+                action = next_step.get("action", f"ask_{field}")
+                state.awaiting_field = field
+                logger.info(f"Next step: {action} (field={field})")
+                return {"action": action, "data": {}}
 
-            # Fallback to original hardcoded flow
+            # If dynamic flow is not available, fallback to original hardcoded logic
             missing_lead = self._get_missing_lead_fields(state)
             if missing_lead:
                 next_field = missing_lead[0]

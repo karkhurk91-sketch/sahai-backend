@@ -36,12 +36,9 @@ async def send_whatsapp_interactive(
     if interactive_data.get('type') == 'button' and 'action' in interactive_data:
         action = interactive_data['action']
         if isinstance(action, list):
-            # The configuration provided a list of buttons directly.
-            # Wrap it as required by the API.
             interactive_data['action'] = {'buttons': action}
             logger.debug("Fixed button action: wrapped list in {'buttons': ...}")
         elif isinstance(action, dict) and 'buttons' not in action:
-            # If action is a dict but missing 'buttons', log a warning.
             logger.warning(f"Button action missing 'buttons' key: {action}")
 
     # For list messages, ensure action is an object with required keys (optional)
@@ -49,9 +46,34 @@ async def send_whatsapp_interactive(
         action = interactive_data['action']
         if not isinstance(action, dict):
             logger.error(f"List action is not a dict: {action}")
-            # Attempt to fix: if it's a list? unlikely, just log and continue
 
-    interactive_data = _validate_interactive_payload(interactive_data)
+    # ----- FIX 3: Ensure interactive.body.text is a string (for both button and list) -----
+    if 'body' in interactive_data:
+        body = interactive_data['body']
+        if isinstance(body, dict) and 'text' in body:
+            text_val = body['text']
+            if not isinstance(text_val, str):
+                body['text'] = str(text_val)
+                logger.warning(f"Converted body.text to string: {body['text'][:50]}...")
+        elif isinstance(body, str):
+            # Already handled by FIX 1, but ensure it's wrapped as object
+            interactive_data['body'] = {'text': body}
+    
+    # ----- Additional safety: Ensure button titles are strings (for button messages) -----
+    if interactive_data.get('type') == 'button' and 'action' in interactive_data:
+        action = interactive_data['action']
+        if isinstance(action, dict) and 'buttons' in action:
+            for btn in action['buttons']:
+                if 'reply' not in btn:
+                    btn['reply'] = {}
+                if 'id' not in btn['reply']:
+                    btn['reply']['id'] = f"btn_{hash(str(btn))}"
+                if 'title' not in btn['reply']:
+                    btn['reply']['title'] = btn.get('title', 'Option')
+                # Ensure title is string
+                if not isinstance(btn['reply']['title'], str):
+                    btn['reply']['title'] = str(btn['reply']['title'])
+
     url = f"https://graph.facebook.com/v21.0/{config['phone_number_id']}/messages"
     headers = {
         "Authorization": f"Bearer {config['access_token']}",

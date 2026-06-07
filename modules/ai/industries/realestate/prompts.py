@@ -17,47 +17,46 @@ class Prompts:
     def _build_prompt_text(self, config: Dict, action: str, data: dict, state) -> str:
         """Build plain text prompt from step config or data."""
         if action == "ask_confirmation":
-            # Try to get summary from data, otherwise fallback to state
+            # Build summary from state (prefer pending_summary else state fields)
             summary = data.get("summary") if data.get("summary") else {}
-            if state and getattr(state, "flow_steps", None):
-                for step in state.flow_steps:
-                    field = step.get("field")
-                    if field and field not in summary:
+            if not summary and state:
+                summary = {}
+                # Collect all fields from flow steps
+                if getattr(state, "flow_steps", None):
+                    for step in state.flow_steps:
+                        field = step.get("field")
+                        if field:
+                            summary[field] = getattr(state, field, "Not provided")
+                else:
+                    # Fallback to standard fields
+                    for field in ["name", "budget", "location", "bhk", "possession"]:
                         summary[field] = getattr(state, field, "Not provided")
-
-            summary = summary or {
-                "name": getattr(state, "name", "Not provided"),
-                "budget": getattr(state, "budget", "Not provided"),
-                "location": getattr(state, "location", "Not provided"),
-                "bhk": getattr(state, "bhk", "Not provided"),
-                "possession": getattr(state, "possession", "Not specified"),
-            }
-
-            lines = []
-            for key, label in [
-                ("name", "Name"),
-                ("budget", "Budget"),
-                ("location", "Location"),
-                ("bhk", "BHK"),
-                ("possession", "Possession"),
-            ]:
-                if key in summary:
-                    lines.append(f"• {label}: {summary.get(key, 'Not provided')}")
-
-            # Append any additional dynamic fields in flow order
+            lines = ["Please confirm your details:"]
+            # Show fields in flow order if available
             if state and getattr(state, "flow_steps", None):
                 for step in state.flow_steps:
                     field = step.get("field")
-                    if field and field not in {"name", "budget", "location", "bhk", "possession"}:
-                        lines.append(f"• {field.replace('_', ' ').title()}: {summary.get(field, 'Not provided')}")
+                    if field and field in summary:
+                        label = field.replace("_", " ").title()
+                        lines.append(f"• {label}: {summary.get(field, 'Not provided')}")
+            else:
+                # Hardcoded order
+                for key, label in [("name", "Name"), ("budget", "Budget"), ("location", "Location"), ("bhk", "BHK"), ("possession", "Possession")]:
+                    if key in summary:
+                        lines.append(f"• {label}: {summary.get(key, 'Not provided')}")
+            return "\n".join(lines)
 
-            confirmation_text = "Please confirm your details:\n" + "\n".join(lines)
-            return confirmation_text
-        # For non‑confirmation steps, extract prompt from config
-        if isinstance(config.get("body"), dict):
-            return config.get("body", {}).get("text", config.get("prompt", ""))
-        return config.get("prompt") or config.get("body") or ""
-
+        # For non‑confirmation steps, extract prompt and ensure it's a string
+        prompt = config.get("prompt") or config.get("body") or ""
+        if isinstance(prompt, dict):
+            prompt = prompt.get("text", "")
+        # Convert to string if not already (e.g., number, None)
+        if not isinstance(prompt, str):
+            prompt = str(prompt) if prompt is not None else "Please respond."
+        # If still empty, use a default
+        if not prompt:
+            prompt = "Please respond."
+        return prompt        
     def _build_value_map(self, config: Dict) -> dict:
         """Build value_map from step config (supports explicit map, options, or list rows)."""
         value_map = config.get("value_map", {}) or {}
