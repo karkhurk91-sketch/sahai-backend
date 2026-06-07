@@ -45,8 +45,8 @@ class RulesEngine:
     EXTRACTORS = {
         "name": r"(?:my name is|i am|called|name is|मेरा नाम)\s*([A-Za-z\u0900-\u097F]+(?:\s+[A-Za-z\u0900-\u097F]+){0,2})",
         "phone": r"(\d{10})",
-        "budget": r"(\d+(?:\.\d+)?)\s*(lac|lakh|lakhs|cr|crore|लाख|करोड़)",
-        "location": r"(?:in|at|near|location|लोकेशन|में)\s*([A-Za-z\u0900-\u097F]+(?:\s+[A-Za-z\u0900-\u097F]+)?)",
+        "budget": r"(\d+(?:\.\d+)?)\s*(?:₹\s*)?(lac|lakh|lakhs|cr|crore|करोड़|l|L)",
+        "location": r"(?:\b(?:in|at|near|location)\b|लोकेशन|में)\s*([A-Za-z\u0900-\u097F]+(?:\s+[A-Za-z\u0900-\u097F]+)?)",
         "bhk": r"(\d+)\s*(bhk|bedroom|बीएचके|बेडरूम)",
         "possession": r"(immediate|now|asap|1[- ]?month[s]?|2[- ]?month[s]?|3[- ]?month[s]?|6[- ]?month[s]?|तुरंत|अभी|जल्दी)",
         "loan_status": r"(cash|pre[- ]approved|preapproved|apply|loan|बिना loan|कैश)",
@@ -299,7 +299,7 @@ class RulesEngine:
             if match:
                 amount = float(match.group(1))
                 unit = match.group(2).lower() if len(match.groups()) > 1 else ""
-                if unit in ["lac", "lakh", "lakhs", "लाख"]:
+                if unit in ["lac", "lakh", "lakhs", "लाख", "l", "L"]:
                     state.budget = f"{int(amount) if amount.is_integer() else amount} lakh"
                     state.budget_amount = amount
                 elif unit in ["crore", "cr", "करोड़"]:
@@ -522,6 +522,25 @@ class RulesEngine:
                 logger.info("Confirmation rejected; requesting correction")
                 return {"action": "ask_which_field_to_correct", "data": {}}
             return {"action": "ask_confirmation_again", "data": {"summary": state.pending_summary}}
+
+        # ----- CONFIRMATION INTENT BEFORE CONFIRMATION STAGE -----
+        if intent in ["confirm_yes", "confirm_no"] and state.stage == "qualification" and not state.confirmation_pending:
+            next_step = self._get_current_step(state)
+            if not next_step:
+                state.stage = "confirmation"
+                state.awaiting_field = None
+                state.calculate_bant_score()
+                state.pending_summary = self._build_summary(state)
+                if intent == "confirm_yes":
+                    state.confirmation_pending = False
+                    state.stage = "recommendation"
+                    state.pending_summary["lead_tag"] = state.lead_tag
+                    self._save_current_summary(state)
+                    logger.info(f"Early confirmation accepted; moving to recommendation stage, lead_tag={state.lead_tag}")
+                    return {"action": "lead_complete", "data": state.pending_summary}
+                state.confirmation_pending = False
+                logger.info("Early confirmation rejected; requesting correction")
+                return {"action": "ask_which_field_to_correct", "data": {}}
 
         # ----- GREETING AFTER CONFIRMATION -----
         if state.stage == "recommendation" and intent == "greeting" and getattr(state, "pending_summary", None):

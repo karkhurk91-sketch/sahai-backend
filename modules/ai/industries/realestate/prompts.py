@@ -12,6 +12,12 @@ class Prompts:
             for step in state.flow_steps:
                 if step.get("action") == action:
                     return step
+            # Fallback: if step action is not explicitly set, map ask_<field> actions to the same step.
+            if action.startswith("ask_"):
+                field_name = action[4:]
+                for step in state.flow_steps:
+                    if step.get("field") == field_name:
+                        return step
         return get_interactive_config(self.industry, action)
 
     def _build_prompt_text(self, config: Dict, action: str, data: dict, state) -> str:
@@ -161,9 +167,10 @@ class Prompts:
                 interactive_reply = self._build_interactive_reply(step_config, action, data, state)
                 if interactive_reply:
                     return interactive_reply
-            # If interactive building failed but step has plain text, return that
-            if step_config.get("type") == "text":
-                return step_config.get("prompt") or step_config.get("body")
+
+        # If the step config is a plain text step, return its prompt or body.
+        if step_config and step_config.get("type") == "text":
+            return step_config.get("prompt") or step_config.get("body")
 
         # ----- HARDCODED FALLBACKS (kept for backward compatibility) -----
         if action == "ask_budget":
