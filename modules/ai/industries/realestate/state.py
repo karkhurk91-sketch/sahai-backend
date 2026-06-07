@@ -40,6 +40,8 @@ class State:
         self.budget_confirmed = False
 
         self.interactive_map = {}
+        self.expecting_field_selection = False
+
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items() if not k.startswith('_')}

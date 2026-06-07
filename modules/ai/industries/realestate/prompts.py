@@ -227,7 +227,18 @@ class Prompts:
         if action == "continue_search":
             return "Okay, continuing with your current property search. What would you like to do next?"
         if action == "ask_which_field_to_correct":
-            return "Which detail would you like to change? (budget / location / bhk / name / possession)"
+            if state and getattr(state, "flow_steps", None):
+                # Build dynamic field list from flow steps
+                fields = []
+                for step in state.flow_steps:
+                    field = step.get("field")
+                    if field and field != "confirm":  # exclude confirmation field
+                        fields.append(field)
+                field_list = " / ".join(fields)
+                return f"Which detail would you like to change? ({field_list})"
+            else:
+                # Fallback to original hardcoded list
+                return "Which detail would you like to change? (budget / location / bhk / name / possession)"
         if action == "ask_which_field":
             return "I didn't catch which field. Please say the field name (budget, location, bhk, name, possession)."
         if action.startswith("ask_new_value_for_"):

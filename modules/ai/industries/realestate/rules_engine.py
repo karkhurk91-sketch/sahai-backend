@@ -3,7 +3,6 @@ import logging
 from .state import State
 from typing import Optional, Tuple
 
-
 logger = logging.getLogger(__name__)
 
 class RulesEngine:
@@ -54,8 +53,6 @@ class RulesEngine:
         "reason": r"(job|relocation|transfer|upgrade|bigger|family|investment|rental income|परिवार|नौकरी)",
     }
 
-    # Default flow for dynamic mode (only used if organization has no custom flow and dynamic mode is not enabled)
-    # This is not used as fallback; it's for reference.
     DEFAULT_FLOW = [
         {"field": "name", "action": "ask_name", "required": True},
         {"field": "budget", "action": "ask_budget", "required": True},
@@ -81,7 +78,6 @@ class RulesEngine:
         return state.flow_steps if self._has_dynamic_flow(state) else None
 
     def _field_has_value(self, state, field):
-        """Return True if field is already captured (any non-None value)."""
         if not field:
             return True
         if field == "budget":
@@ -90,11 +86,6 @@ class RulesEngine:
         return val is not None
 
     def _get_current_step(self, state):
-        """
-        Return the step that the user is currently on.
-        Iterates over flow steps in order and returns the first step whose field is missing.
-        Optional steps are still considered part of the flow so custom flows execute in order.
-        """
         steps = self._get_flow_steps(state)
         if not steps:
             return None
@@ -103,21 +94,18 @@ class RulesEngine:
             if field and self._field_has_value(state, field):
                 continue
             return step
-        return None  # All steps completed
+        return None
 
     def _get_next_missing_lead_step(self, state):
-        """Return the next step in the current dynamic flow that still needs a value."""
         return self._get_current_step(state)
 
     def _dynamic_confirmation_step(self, state):
-        """Return the confirmation step from a custom flow, if configured."""
         for step in self._get_flow_steps(state) or []:
             if step.get("action") == "ask_confirmation" or step.get("field") == "confirm":
                 return step
         return None
 
     def _confirm_value(self, state):
-        """Normalize any confirmation field value to True/False if present."""
         if not hasattr(state, "confirm"):
             return None
         value = getattr(state, "confirm")
@@ -226,9 +214,7 @@ class RulesEngine:
         else:
             state.previous_lead_summary = self._build_summary(state)
 
-    # ----- Original hardcoded missing fields (kept as fallback) -----
     def _get_missing_lead_fields(self, state):
-        """Original hardcoded list of required fields (name, budget, location, bhk, possession)."""
         missing = []
         if not state.name:
             missing.append("name")
@@ -395,9 +381,7 @@ class RulesEngine:
             if state.awaiting_field == field:
                 state.awaiting_field = None
             return
-
         else:
-            # Try to infer field from awaiting context
             inferred = self._infer_field_from_awaiting(text, state)
             if inferred:
                 field, value = inferred
@@ -464,6 +448,7 @@ class RulesEngine:
                     extracted = True
         if not extracted:
             self._fill_awaiting_field(text, state)
+
     def _parse_budget_amount(self, budget_str: str) -> float:
         match = re.search(r'(\d+(?:\.\d+)?)', budget_str)
         if match:
@@ -472,12 +457,16 @@ class RulesEngine:
 
     def _extract_field_to_correct(self, text, state=None):
         text_normalized = self._normalize_text(text)
-        if state is not None:
-            for step in self._get_flow_steps(state) or []:
+        if state is not None and self._has_dynamic_flow(state):
+            for step in state.flow_steps:
                 field = step.get("field")
-                if not field:
+                if not field or field == "confirm":
                     continue
-                if field.lower() in text_normalized or field.replace("_", " ").lower() in text_normalized:
+                if text_normalized == field.lower():
+                    return field
+                if text_normalized == field.replace("_", " ").lower():
+                    return field
+                if field.lower() in text_normalized:
                     return field
                 label = step.get("label") or step.get("title") or step.get("header")
                 if label and label.lower() in text_normalized:
@@ -497,13 +486,31 @@ class RulesEngine:
         return None
 
     def process(self, user_input: str, state: State) -> dict:
+        # ----- FIX: Handle field selection after "Change" (with fallback) -----
+        # If we are expecting a field name OR we are in confirmation stage (after Change) without a pending correction,
+        # treat the user input as the field name to change.
+        if getattr(state, 'expecting_field_selection', False) or (state.stage == "confirmation" and not state.confirmation_pending and not state.pending_correction_field):
+            # Clear the flag if it was set
+            state.expecting_field_selection = False
+            field = user_input.strip().lower()
+            if field in ["mobile", "contact"]:
+                field = "phone"
+            available_fields = self._get_available_fields(state)
+            if field in available_fields:
+                state.pending_correction_field = field
+                state.awaiting_field = field
+                return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
+            else:
+                # Field not recognised – ask again
+                return {"action": "ask_which_field_to_correct", "data": {}}
+
+        # ----- Restore interactive map -----
         if hasattr(state, 'interactive_map') and state.interactive_map:
             self.id_value_map = state.interactive_map
 
         intent = self.detect_intent(user_input)
         state.last_intent = intent
 
-        # ----- GREETING -----
         if state.stage == "greeting":
             if intent == "greeting":
                 state.awaiting_field = None
@@ -512,7 +519,6 @@ class RulesEngine:
             state.stage = "qualification"
             logger.info("Transitioning from greeting to qualification")
 
-        # ----- CONFIRMATION STATE -----
         if state.confirmation_pending:
             if intent == "confirm_yes":
                 state.confirmation_pending = False
@@ -525,13 +531,12 @@ class RulesEngine:
                 return {"action": "lead_complete", "data": state.pending_summary}
             if intent == "confirm_no" or intent == "correction":
                 state.confirmation_pending = False
-                state.stage = "confirmation"  # Keep in confirmation to enable correction flow
                 state.awaiting_field = None
+                state.expecting_field_selection = True   # Flag to expect field name in next message
                 logger.info("Confirmation rejected; requesting correction")
                 return {"action": "ask_which_field_to_correct", "data": {}}
             return {"action": "ask_confirmation_again", "data": {"summary": state.pending_summary}}
 
-        # ----- CONFIRMATION INTENT BEFORE CONFIRMATION STAGE -----
         if intent in ["confirm_yes", "confirm_no"] and state.stage == "qualification" and not state.confirmation_pending:
             next_step = self._get_current_step(state)
             if not next_step:
@@ -550,11 +555,9 @@ class RulesEngine:
                 logger.info("Early confirmation rejected; requesting correction")
                 return {"action": "ask_which_field_to_correct", "data": {}}
 
-        # ----- GREETING AFTER CONFIRMATION -----
         if state.stage == "recommendation" and intent == "greeting" and getattr(state, "pending_summary", None):
             return {"action": "ask_continue_or_new_property", "data": {}}
 
-        # ----- NEW PROPERTY / CONTINUE HANDLING -----
         if intent == "new_property":
             self._reset_for_new_property(state)
             next_action = self._get_first_missing_step_action(state)
@@ -563,7 +566,6 @@ class RulesEngine:
         if intent == "continue" and state.stage == "recommendation":
             return {"action": "continue_search", "data": {}}
 
-        # ----- FIELD SELECTION DURING CORRECTION -----
         if intent == "select_field" and not state.pending_correction_field:
             field = user_input.strip().lower()
             if field == "mobile" or field == "contact":
@@ -576,7 +578,6 @@ class RulesEngine:
             logger.info(f"Field correction started for {field}")
             return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
 
-        # ----- FIELD CORRECTION FROM CONFIRMATION STAGE -----
         if state.stage == "confirmation" and not state.confirmation_pending and not state.pending_correction_field:
             field = self._extract_field_to_correct(user_input, state)
             if field:
@@ -584,10 +585,8 @@ class RulesEngine:
                 state.awaiting_field = field
                 logger.info(f"Field correction started for {field}")
                 return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
-            # If no field extracted, ask user to specify
             return {"action": "ask_which_field_to_correct", "data": {}}
 
-        # ----- DIRECT INTENT HANDLING -----
         if intent == "site_visit":
             state.awaiting_field = None
             return {"action": "offer_site_visit", "data": {}}
@@ -604,22 +603,17 @@ class RulesEngine:
         if intent in ["sell", "rent"]:
             pass
 
-        # ----- FIELD EXTRACTION -----
         if not state.pending_correction_field:
             self.extract_fields(user_input, state)
 
-        # ----- QUALIFICATION STAGE (with dynamic flow) -----
         if state.stage == "qualification":
-            # If we are already waiting for a field, handle it
             if state.awaiting_field:
-                # If the awaited field is now filled (by extraction), clear it
                 if self._field_has_value(state, state.awaiting_field):
                     state.awaiting_field = None
                 else:
                     action = self._get_action_for_field(state, state.awaiting_field)
                     return {"action": action, "data": {}}
 
-            # Get the next missing step from the dynamic flow (or fallback to hardcoded)
             next_step = self._get_current_step(state)
             if next_step:
                 field = next_step.get("field")
@@ -628,8 +622,6 @@ class RulesEngine:
                 logger.info(f"Next step: {action} (field={field})")
                 return {"action": action, "data": {}}
 
-            # If a dynamic flow includes an explicit confirmation step and the user has already answered it,
-            # complete the lead immediately rather than re-asking confirmation.
             if self._has_dynamic_flow(state):
                 confirm_step = self._dynamic_confirmation_step(state)
                 confirm_value = self._confirm_value(state)
@@ -668,7 +660,6 @@ class RulesEngine:
                 state.awaiting_field = next_field
                 return {"action": f"ask_{next_field}", "data": {}}
 
-            # All lead fields collected → move to confirmation
             state.stage = "confirmation"
             state.confirmation_pending = True
             state.awaiting_field = None
@@ -694,7 +685,6 @@ class RulesEngine:
             logger.info("Confirmation started; summary prepared")
             return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
 
-        # ----- CORRECTION HANDLING (for stage != confirmation) -----
         if state.stage != "confirmation" and intent == "correction":
             field = self._extract_field_to_correct(user_input, state)
             if field:
@@ -704,7 +694,6 @@ class RulesEngine:
                 return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
             return {"action": "ask_which_field", "data": {}}
 
-        # ----- WAITING FOR NEW VALUE DURING CORRECTION -----
         if state.pending_correction_field:
             field = state.pending_correction_field
             new_value = user_input.strip()
@@ -750,7 +739,6 @@ class RulesEngine:
             state.awaiting_field = None
             return {"action": "ask_which_field", "data": {}}
 
-        # ----- RECOMMENDATION STAGE -----
         if state.stage == "recommendation":
             if state.lead_tag is None:
                 state.calculate_bant_score()
@@ -762,12 +750,6 @@ class RulesEngine:
         return {"action": "fallback", "data": {}}
 
     def _infer_field_from_awaiting(self, button_id: str, state: State) -> Optional[tuple]:
-        """
-        When an interactive button ID is not in the map, try to infer the field
-        from the current awaiting_field or the next missing step.
-        Returns (field, value) or None.
-        """
-        # First, try to get field from awaiting_field
         field = state.awaiting_field
         if not field:
             next_step = self._get_current_step(state)
@@ -775,10 +757,6 @@ class RulesEngine:
                 field = next_step.get("field")
         if not field:
             return None
-        # Try to extract value from the button ID (e.g., floor_low -> lower)
-        # You can optionally parse the ID, but use the button's title? Not available here.
-        # Simpler: treat the button ID itself as the value? Not ideal.
-        # Instead, we can look up the step's options and find the matching ID.
         steps = self._get_flow_steps(state)
         for step in steps:
             if step.get("field") == field and step.get("type") == "button":
