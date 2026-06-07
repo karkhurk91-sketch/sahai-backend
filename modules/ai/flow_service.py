@@ -64,6 +64,27 @@ async def get_org_conversation_flow(org_id: str, flow_type: str = "buyer", indus
             return default_steps, seeded
         return default_steps
 
+    # If no configured flow exists for the requested type, try any active flow for the organization.
+    if flow_type == "buyer":
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(OrganizationConversationFlow.steps)
+                .where(
+                    OrganizationConversationFlow.organization_id == org_uuid,
+                    OrganizationConversationFlow.is_active == True
+                )
+                .limit(1)
+            )
+            steps = result.scalar_one_or_none()
+            if steps:
+                if not isinstance(steps, list):
+                    steps = []
+                _FLOW_CACHE[cache_key] = steps
+                logger.info(f"Loaded fallback active flow for org {org_id} with flow_type={flow_type}")
+                if return_seeded:
+                    return steps, False
+                return steps
+
     if return_seeded:
         return None, False
     return None

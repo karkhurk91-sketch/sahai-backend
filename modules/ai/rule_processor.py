@@ -59,16 +59,22 @@ async def get_rule_reply(org_id: str, conversation_id: str, user_input: str, cus
     # 5. Load per-organization conversation flow if not already present in state
     # (Avoid reloading if the state already has a flow, e.g., from a previous message)
     if not hasattr(state, 'flow_steps') or not state.flow_steps:
-        org_flow = await get_org_conversation_flow(org_id, flow_type="buyer")
+        flow_type = getattr(state, 'flow_type', None) or "buyer"
+        org_flow = await get_org_conversation_flow(org_id, flow_type=flow_type)
+        if not org_flow and flow_type != "buyer":
+            # If a non-buyer flow is configured but missing, fallback to buyer.
+            org_flow = await get_org_conversation_flow(org_id, flow_type="buyer")
+            if org_flow:
+                flow_type = "buyer"
         if org_flow:
             state.flow_steps = org_flow
-            state.flow_type = "buyer"
+            state.flow_type = flow_type
             state.flow_source = "db"
         else:
-            default_flow = get_default_conversation_flow(industry, flow_type="buyer")
+            default_flow = get_default_conversation_flow(industry, flow_type=flow_type)
             if default_flow:
                 state.flow_steps = default_flow
-                state.flow_type = "buyer"
+                state.flow_type = flow_type
                 state.flow_source = "default"
 
     # 6. Run rules engine

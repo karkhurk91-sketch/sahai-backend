@@ -1,6 +1,8 @@
 import re
 import logging
 from .state import State
+from typing import Optional, Tuple
+
 
 logger = logging.getLogger(__name__)
 
@@ -387,6 +389,16 @@ class RulesEngine:
                 state.awaiting_field = None
             return
 
+        else:
+            # Try to infer field from awaiting context
+            inferred = self._infer_field_from_awaiting(text, state)
+            if inferred:
+                field, value = inferred
+                setattr(state, field, value)
+                if state.awaiting_field == field:
+                    state.awaiting_field = None
+                return
+
         if self._match_typed_text_to_button_option(text, state):
             return
 
@@ -445,7 +457,6 @@ class RulesEngine:
                     extracted = True
         if not extracted:
             self._fill_awaiting_field(text, state)
-
     def _parse_budget_amount(self, budget_str: str) -> float:
         match = re.search(r'(\d+(?:\.\d+)?)', budget_str)
         if match:
@@ -587,7 +598,22 @@ class RulesEngine:
                 logger.info(f"Next step: {action} (field={field})")
                 return {"action": action, "data": {}}
 
-            # If dynamic flow is not available, fallback to original hardcoded logic
+            # If dynamic flow is available and all required fields are captured,
+            # transition directly to confirmation without hardcoded fallback.
+            if self._has_dynamic_flow(state):
+                state.stage = "confirmation"
+                state.confirmation_pending = True
+                state.awaiting_field = None
+                state.calculate_bant_score()
+                summary = {}
+                for step in state.flow_steps:
+                    field = step.get("field")
+                    if field:
+                        summary[field] = getattr(state, field, None)
+                state.pending_summary = summary
+                logger.info("Confirmation started; dynamic flow completed")
+                return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
+
             missing_lead = self._get_missing_lead_fields(state)
             if missing_lead:
                 next_field = missing_lead[0]
@@ -686,3 +712,30 @@ class RulesEngine:
         logger.info("Falling back to rule-mode default reply")
         state.awaiting_field = None
         return {"action": "fallback", "data": {}}
+
+    def _infer_field_from_awaiting(self, button_id: str, state: State) -> Optional[tuple]:
+        """
+        When an interactive button ID is not in the map, try to infer the field
+        from the current awaiting_field or the next missing step.
+        Returns (field, value) or None.
+        """
+        # First, try to get field from awaiting_field
+        field = state.awaiting_field
+        if not field:
+            next_step = self._get_current_step(state)
+            if next_step:
+                field = next_step.get("field")
+        if not field:
+            return None
+        # Try to extract value from the button ID (e.g., floor_low -> lower)
+        # You can optionally parse the ID, but use the button's title? Not available here.
+        # Simpler: treat the button ID itself as the value? Not ideal.
+        # Instead, we can look up the step's options and find the matching ID.
+        steps = self._get_flow_steps(state)
+        for step in steps:
+            if step.get("field") == field and step.get("type") == "button":
+                for opt in step.get("options", []):
+                    if opt.get("id") == button_id:
+                        value = opt.get("value", opt.get("title"))
+                        return (field, value)
+        return None

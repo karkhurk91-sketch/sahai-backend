@@ -46,8 +46,9 @@ class State:
 
     def from_dict(self, data):
         for k, v in data.items():
-            if hasattr(self, k):
-                setattr(self, k, v)
+            if k.startswith('_'):
+                continue
+            setattr(self, k, v)
 
     def calculate_bant_score(self):
         """Compute BANT score and lead tag based on collected fields."""
