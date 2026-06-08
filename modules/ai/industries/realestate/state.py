@@ -5,8 +5,8 @@ class State:
         # Basic lead fields
         self.name = None
         self.phone = None
-        self.budget = None          # human‑readable string, e.g., "50 lakh"
-        self.budget_amount = None   # numeric in lakhs
+        self.budget = None          
+        self.budget_amount = None   
         self.location = None
         self.bhk = None
         self.property_type = None
@@ -28,7 +28,7 @@ class State:
         self.flow_type = "buyer"
         self.flow_steps = []
         self.flow_source = None
-        self.current_step_index = 0   # <--- ADDED: tracks current position in dynamic flow
+        self.current_step_index = 0
 
         # Confirmation & correction
         self.confirmation_pending = False
@@ -38,9 +38,12 @@ class State:
         self.previous_lead_summary = None
 
         self.budget_confirmed = False
-
         self.interactive_map = {}
         self.expecting_field_selection = False
+        self.awaiting_field_name = False
+        self.last_action = None
+        self.correction_pending = False
+
 
 
     def to_dict(self):

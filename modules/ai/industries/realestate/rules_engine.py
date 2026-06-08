@@ -486,214 +486,7 @@ class RulesEngine:
         return None
 
     def process(self, user_input: str, state: State) -> dict:
-        # ----- FIX: Handle field selection after "Change" (with fallback) -----
-        # If we are expecting a field name OR we are in confirmation stage (after Change) without a pending correction,
-        # treat the user input as the field name to change.
-        if getattr(state, 'expecting_field_selection', False) or (state.stage == "confirmation" and not state.confirmation_pending and not state.pending_correction_field):
-            # Clear the flag if it was set
-            state.expecting_field_selection = False
-            field = user_input.strip().lower()
-            if field in ["mobile", "contact"]:
-                field = "phone"
-            available_fields = self._get_available_fields(state)
-            if field in available_fields:
-                state.pending_correction_field = field
-                state.awaiting_field = field
-                return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
-            else:
-                # Field not recognised – ask again
-                return {"action": "ask_which_field_to_correct", "data": {}}
-
-        # ----- Restore interactive map -----
-        if hasattr(state, 'interactive_map') and state.interactive_map:
-            self.id_value_map = state.interactive_map
-
-        intent = self.detect_intent(user_input)
-        state.last_intent = intent
-
-        if state.stage == "greeting":
-            if intent == "greeting":
-                state.awaiting_field = None
-                logger.info("Greeting detected")
-                return {"action": "greeting", "data": {}}
-            state.stage = "qualification"
-            logger.info("Transitioning from greeting to qualification")
-
-        if state.confirmation_pending:
-            if intent == "confirm_yes":
-                state.confirmation_pending = False
-                state.stage = "recommendation"
-                state.awaiting_field = None
-                state.calculate_bant_score()
-                state.pending_summary["lead_tag"] = state.lead_tag
-                self._save_current_summary(state)
-                logger.info(f"Confirmation accepted; moving to recommendation stage, lead_tag={state.lead_tag}")
-                return {"action": "lead_complete", "data": state.pending_summary}
-            if intent == "confirm_no" or intent == "correction":
-                state.confirmation_pending = False
-                state.awaiting_field = None
-                state.expecting_field_selection = True   # Flag to expect field name in next message
-                logger.info("Confirmation rejected; requesting correction")
-                return {"action": "ask_which_field_to_correct", "data": {}}
-            return {"action": "ask_confirmation_again", "data": {"summary": state.pending_summary}}
-
-        if intent in ["confirm_yes", "confirm_no"] and state.stage == "qualification" and not state.confirmation_pending:
-            next_step = self._get_current_step(state)
-            if not next_step:
-                state.stage = "confirmation"
-                state.awaiting_field = None
-                state.calculate_bant_score()
-                state.pending_summary = self._build_summary(state)
-                if intent == "confirm_yes":
-                    state.confirmation_pending = False
-                    state.stage = "recommendation"
-                    state.pending_summary["lead_tag"] = state.lead_tag
-                    self._save_current_summary(state)
-                    logger.info(f"Early confirmation accepted; moving to recommendation stage, lead_tag={state.lead_tag}")
-                    return {"action": "lead_complete", "data": state.pending_summary}
-                state.confirmation_pending = False
-                logger.info("Early confirmation rejected; requesting correction")
-                return {"action": "ask_which_field_to_correct", "data": {}}
-
-        if state.stage == "recommendation" and intent == "greeting" and getattr(state, "pending_summary", None):
-            return {"action": "ask_continue_or_new_property", "data": {}}
-
-        if intent == "new_property":
-            self._reset_for_new_property(state)
-            next_action = self._get_first_missing_step_action(state)
-            state.awaiting_field = next_action.replace("ask_", "")
-            return {"action": next_action, "data": {}}
-        if intent == "continue" and state.stage == "recommendation":
-            return {"action": "continue_search", "data": {}}
-
-        if intent == "select_field" and not state.pending_correction_field:
-            field = user_input.strip().lower()
-            if field == "mobile" or field == "contact":
-                field = "phone"
-            available_fields = self._get_available_fields(state)
-            if field not in available_fields:
-                return {"action": "ask_which_field", "data": {}}
-            state.pending_correction_field = field
-            state.awaiting_field = field
-            logger.info(f"Field correction started for {field}")
-            return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
-
-        if state.stage == "confirmation" and not state.confirmation_pending and not state.pending_correction_field:
-            field = self._extract_field_to_correct(user_input, state)
-            if field:
-                state.pending_correction_field = field
-                state.awaiting_field = field
-                logger.info(f"Field correction started for {field}")
-                return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
-            return {"action": "ask_which_field_to_correct", "data": {}}
-
-        if intent == "site_visit":
-            state.awaiting_field = None
-            return {"action": "offer_site_visit", "data": {}}
-        if intent == "brochure":
-            state.awaiting_field = None
-            return {"action": "reply_brochure", "data": {}}
-        if intent == "loan":
-            state.awaiting_field = None
-            return {"action": "reply_loan", "data": {}}
-        if intent.startswith("objection"):
-            obj = intent.split("_")[1]
-            state.awaiting_field = None
-            return {"action": "handle_objection", "data": {"objection_type": obj}}
-        if intent in ["sell", "rent"]:
-            pass
-
-        if not state.pending_correction_field:
-            self.extract_fields(user_input, state)
-
-        if state.stage == "qualification":
-            if state.awaiting_field:
-                if self._field_has_value(state, state.awaiting_field):
-                    state.awaiting_field = None
-                else:
-                    action = self._get_action_for_field(state, state.awaiting_field)
-                    return {"action": action, "data": {}}
-
-            next_step = self._get_current_step(state)
-            if next_step:
-                field = next_step.get("field")
-                action = next_step.get("action", f"ask_{field}")
-                state.awaiting_field = field
-                logger.info(f"Next step: {action} (field={field})")
-                return {"action": action, "data": {}}
-
-            if self._has_dynamic_flow(state):
-                confirm_step = self._dynamic_confirmation_step(state)
-                confirm_value = self._confirm_value(state)
-                if confirm_step is not None and confirm_value is not None:
-                    if confirm_value:
-                        state.confirmation_pending = False
-                        state.stage = "recommendation"
-                        state.awaiting_field = None
-                        state.calculate_bant_score()
-                        state.pending_summary = self._build_summary(state)
-                        state.pending_summary["lead_tag"] = state.lead_tag
-                        self._save_current_summary(state)
-                        logger.info("Confirmation accepted; completing lead from dynamic flow")
-                        return {"action": "lead_complete", "data": state.pending_summary}
-                    state.confirmation_pending = False
-                    state.awaiting_field = None
-                    logger.info("Confirmation rejected; requesting correction from dynamic flow")
-                    return {"action": "ask_which_field_to_correct", "data": {}}
-
-                state.stage = "confirmation"
-                state.confirmation_pending = True
-                state.awaiting_field = None
-                state.calculate_bant_score()
-                summary = {}
-                for step in state.flow_steps:
-                    field = step.get("field")
-                    if field:
-                        summary[field] = getattr(state, field, None)
-                state.pending_summary = summary
-                logger.info("Confirmation started; dynamic flow completed")
-                return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
-
-            missing_lead = self._get_missing_lead_fields(state)
-            if missing_lead:
-                next_field = missing_lead[0]
-                state.awaiting_field = next_field
-                return {"action": f"ask_{next_field}", "data": {}}
-
-            state.stage = "confirmation"
-            state.confirmation_pending = True
-            state.awaiting_field = None
-            state.calculate_bant_score()
-            summary = {
-                "name": state.name,
-                "phone": state.phone,
-                "budget": state.budget,
-                "location": state.location,
-                "bhk": state.bhk,
-                "possession": state.possession,
-                "loan_status": state.loan_status,
-                "is_decision_maker": state.is_decision_maker,
-                "reason": state.reason,
-                "lead_tag": state.lead_tag,
-            }
-            if self._has_dynamic_flow(state):
-                for step in state.flow_steps:
-                    field = step.get("field")
-                    if field and field not in summary:
-                        summary[field] = getattr(state, field, None)
-            state.pending_summary = summary
-            logger.info("Confirmation started; summary prepared")
-            return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
-
-        if state.stage != "confirmation" and intent == "correction":
-            field = self._extract_field_to_correct(user_input, state)
-            if field:
-                state.pending_correction_field = field
-                state.awaiting_field = field
-                logger.info(f"Field correction requested for {field}")
-                return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
-            return {"action": "ask_which_field", "data": {}}
-
+        # ========== STEP 0: Handle pending correction (new value input) ==========
         if state.pending_correction_field:
             field = state.pending_correction_field
             new_value = user_input.strip()
@@ -715,30 +508,255 @@ class RulesEngine:
                 state.stage = "confirmation"
                 state.confirmation_pending = True
                 state.calculate_bant_score()
-                summary = {
-                    "name": state.name,
-                    "phone": state.phone,
-                    "budget": state.budget,
-                    "location": state.location,
-                    "bhk": state.bhk,
-                    "possession": state.possession,
-                    "loan_status": state.loan_status,
-                    "is_decision_maker": state.is_decision_maker,
-                    "reason": state.reason,
-                    "lead_tag": state.lead_tag,
-                }
+                summary = {}
                 if self._has_dynamic_flow(state):
                     for step in state.flow_steps:
-                        field = step.get("field")
-                        if field and field not in summary:
-                            summary[field] = getattr(state, field, None)
+                        f = step.get("field")
+                        if f:
+                            summary[f] = getattr(state, f, None)
+                else:
+                    summary = {
+                        "name": state.name,
+                        "phone": state.phone,
+                        "budget": state.budget,
+                        "location": state.location,
+                        "bhk": state.bhk,
+                        "possession": state.possession,
+                        "loan_status": state.loan_status,
+                        "is_decision_maker": state.is_decision_maker,
+                        "reason": state.reason,
+                        "lead_tag": state.lead_tag,
+                    }
                 state.pending_summary = summary
-                logger.info(f"Field correction applied for {field}")
-                return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
-            state.pending_correction_field = None
+                return {"action": "ask_confirmation", "data": {"summary": summary}}
+            else:
+                state.pending_correction_field = None
+                state.awaiting_field = None
+                return {"action": "ask_which_field", "data": {}}
+
+        # ========== STEP 1: Heuristic for field name selection after "Change" ==========
+        # This runs before intent detection and is the primary mechanism for correction.
+        if state.stage == "confirmation" and not state.confirmation_pending and not state.pending_correction_field:
+            trimmed = user_input.strip().lower()
+            # Single word, not a common confirmation/control word
+            if " " not in trimmed and trimmed not in ["yes", "no", "confirm", "change"]:
+                if self._has_dynamic_flow(state):
+                    valid_fields = [step.get("field") for step in state.flow_steps if step.get("field") and step.get("field") != "confirm"]
+                else:
+                    valid_fields = ["name", "budget", "location", "bhk", "possession"]
+                if trimmed in valid_fields:
+                    state.pending_correction_field = trimmed
+                    state.awaiting_field = trimmed
+                    logger.info(f"FIELD SELECTION: treating '{trimmed}' as field to correct")
+                    return {"action": f"ask_new_value_for_{trimmed}", "data": {"field": trimmed}}
+
+        # ========== STEP 2: Restore interactive map ==========
+        if hasattr(state, 'interactive_map') and state.interactive_map:
+            self.id_value_map = state.interactive_map
+
+        # ========== STEP 3: Intent detection ==========
+        intent = self.detect_intent(user_input)
+        state.last_intent = intent
+        logger.info(f"[PROCESS] intent={intent}, stage={state.stage}, confirmation_pending={state.confirmation_pending}, awaiting_field={state.awaiting_field}, pending_correction={state.pending_correction_field}")
+
+        # ----- GREETING -----
+        if state.stage == "greeting":
+            if intent == "greeting":
+                state.awaiting_field = None
+                logger.info("Greeting detected")
+                return {"action": "greeting", "data": {}}
+            state.stage = "qualification"
+            logger.info("Transitioning from greeting to qualification")
+
+        # ----- CONFIRMATION STATE -----
+        if state.confirmation_pending:
+            if intent == "confirm_yes":
+                state.confirmation_pending = False
+                state.stage = "recommendation"
+                state.awaiting_field = None
+                state.calculate_bant_score()
+                state.pending_summary["lead_tag"] = state.lead_tag
+                self._save_current_summary(state)
+                logger.info(f"Confirmation accepted; moving to recommendation stage, lead_tag={state.lead_tag}")
+                return {"action": "lead_complete", "data": state.pending_summary}
+            if intent == "confirm_no" or intent == "correction":
+                state.confirmation_pending = False
+                state.awaiting_field = None
+                state.pending_correction_field = None
+                logger.info("Confirmation rejected; requesting correction")
+                return {"action": "ask_which_field_to_correct", "data": {}}
+            return {"action": "ask_confirmation_again", "data": {"summary": state.pending_summary}}
+
+        # ----- EARLY CONFIRMATION (when all fields filled but not in confirmation stage) -----
+        if intent in ["confirm_yes", "confirm_no"] and state.stage == "qualification" and not state.confirmation_pending:
+            next_step = self._get_current_step(state)
+            if not next_step:
+                state.stage = "confirmation"
+                state.awaiting_field = None
+                state.calculate_bant_score()
+                state.pending_summary = self._build_summary(state)
+                if intent == "confirm_yes":
+                    state.confirmation_pending = False
+                    state.stage = "recommendation"
+                    state.pending_summary["lead_tag"] = state.lead_tag
+                    self._save_current_summary(state)
+                    logger.info(f"Early confirmation accepted; moving to recommendation stage, lead_tag={state.lead_tag}")
+                    return {"action": "lead_complete", "data": state.pending_summary}
+                state.confirmation_pending = False
+                logger.info("Early confirmation rejected; requesting correction")
+                return {"action": "ask_which_field_to_correct", "data": {}}
+
+        # ----- GREETING AFTER CONFIRMATION -----
+        if state.stage == "recommendation" and intent == "greeting" and getattr(state, "pending_summary", None):
+            return {"action": "ask_continue_or_new_property", "data": {}}
+
+        # ----- NEW PROPERTY / CONTINUE HANDLING -----
+        if intent == "new_property":
+            self._reset_for_new_property(state)
+            next_action = self._get_first_missing_step_action(state)
+            state.awaiting_field = next_action.replace("ask_", "")
+            return {"action": next_action, "data": {}}
+        if intent == "continue" and state.stage == "recommendation":
+            return {"action": "continue_search", "data": {}}
+
+        # ----- FIELD SELECTION DURING CORRECTION (alternative path) -----
+        if intent == "select_field" and not state.pending_correction_field:
+            field = user_input.strip().lower()
+            if field == "mobile" or field == "contact":
+                field = "phone"
+            available_fields = self._get_available_fields(state)
+            if field not in available_fields:
+                return {"action": "ask_which_field", "data": {}}
+            state.pending_correction_field = field
+            state.awaiting_field = field
+            logger.info(f"Field correction started for {field}")
+            return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
+
+        # ----- CORRECTION FROM CONFIRMATION STAGE (without flag) -----
+        if state.stage == "confirmation" and not state.confirmation_pending and not state.pending_correction_field:
+            field = self._extract_field_to_correct(user_input, state)
+            if field:
+                state.pending_correction_field = field
+                state.awaiting_field = field
+                logger.info(f"Field correction started for {field}")
+                return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
+            return {"action": "ask_which_field_to_correct", "data": {}}
+
+        # ----- DIRECT INTENT HANDLING -----
+        if intent == "site_visit":
             state.awaiting_field = None
+            return {"action": "offer_site_visit", "data": {}}
+        if intent == "brochure":
+            state.awaiting_field = None
+            return {"action": "reply_brochure", "data": {}}
+        if intent == "loan":
+            state.awaiting_field = None
+            return {"action": "reply_loan", "data": {}}
+        if intent.startswith("objection"):
+            obj = intent.split("_")[1]
+            state.awaiting_field = None
+            return {"action": "handle_objection", "data": {"objection_type": obj}}
+        if intent in ["sell", "rent"]:
+            pass
+
+        # ----- FIELD EXTRACTION -----
+        if not state.pending_correction_field:
+            self.extract_fields(user_input, state)
+
+        # ----- QUALIFICATION STAGE (dynamic flow) -----
+        if state.stage == "qualification":
+            if state.awaiting_field:
+                if self._field_has_value(state, state.awaiting_field):
+                    state.awaiting_field = None
+                else:
+                    action = self._get_action_for_field(state, state.awaiting_field)
+                    return {"action": action, "data": {}}
+
+            next_step = self._get_current_step(state)
+            if next_step:
+                field = next_step.get("field")
+                action = next_step.get("action", f"ask_{field}")
+                state.awaiting_field = field
+                logger.info(f"Next step: {action} (field={field})")
+                return {"action": action, "data": {}}
+
+            # No more steps – go to confirmation or lead completion if already confirmed
+            if self._has_dynamic_flow(state):
+                confirm_step = self._dynamic_confirmation_step(state)
+                confirm_value = self._confirm_value(state)
+                if confirm_step is not None and confirm_value is not None:
+                    if confirm_value:
+                        state.confirmation_pending = False
+                        state.stage = "recommendation"
+                        state.awaiting_field = None
+                        state.calculate_bant_score()
+                        state.pending_summary = self._build_summary(state)
+                        state.pending_summary["lead_tag"] = state.lead_tag
+                        self._save_current_summary(state)
+                        logger.info("Confirmation accepted; completing lead from dynamic flow")
+                        return {"action": "lead_complete", "data": state.pending_summary}
+                    state.confirmation_pending = False
+                    state.awaiting_field = None
+                    logger.info("Confirmation rejected; requesting correction from dynamic flow")
+                    return {"action": "ask_which_field_to_correct", "data": {}}
+                # No confirmation step in dynamic flow – enter confirmation stage
+                state.stage = "confirmation"
+                state.confirmation_pending = True
+                state.awaiting_field = None
+                state.calculate_bant_score()
+                summary = {}
+                for step in state.flow_steps:
+                    f = step.get("field")
+                    if f:
+                        summary[f] = getattr(state, f, None)
+                state.pending_summary = summary
+                logger.info("Confirmation started; dynamic flow completed")
+                return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
+
+            # Fallback to hardcoded flow
+            missing_lead = self._get_missing_lead_fields(state)
+            if missing_lead:
+                next_field = missing_lead[0]
+                state.awaiting_field = next_field
+                return {"action": f"ask_{next_field}", "data": {}}
+
+            # All hardcoded fields collected
+            state.stage = "confirmation"
+            state.confirmation_pending = True
+            state.awaiting_field = None
+            state.calculate_bant_score()
+            summary = {
+                "name": state.name,
+                "phone": state.phone,
+                "budget": state.budget,
+                "location": state.location,
+                "bhk": state.bhk,
+                "possession": state.possession,
+                "loan_status": state.loan_status,
+                "is_decision_maker": state.is_decision_maker,
+                "reason": state.reason,
+                "lead_tag": state.lead_tag,
+            }
+            if self._has_dynamic_flow(state):
+                for step in state.flow_steps:
+                    f = step.get("field")
+                    if f and f not in summary:
+                        summary[f] = getattr(state, f, None)
+            state.pending_summary = summary
+            logger.info("Confirmation started; summary prepared")
+            return {"action": "ask_confirmation", "data": {"summary": state.pending_summary}}
+
+        # ----- CORRECTION HANDLING (outside confirmation) -----
+        if state.stage != "confirmation" and intent == "correction":
+            field = self._extract_field_to_correct(user_input, state)
+            if field:
+                state.pending_correction_field = field
+                state.awaiting_field = field
+                logger.info(f"Field correction requested for {field}")
+                return {"action": f"ask_new_value_for_{field}", "data": {"field": field}}
             return {"action": "ask_which_field", "data": {}}
 
+        # ----- RECOMMENDATION STAGE -----
         if state.stage == "recommendation":
             if state.lead_tag is None:
                 state.calculate_bant_score()
@@ -748,7 +766,6 @@ class RulesEngine:
         logger.info("Falling back to rule-mode default reply")
         state.awaiting_field = None
         return {"action": "fallback", "data": {}}
-
     def _infer_field_from_awaiting(self, button_id: str, state: State) -> Optional[tuple]:
         field = state.awaiting_field
         if not field:
