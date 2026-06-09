@@ -8,6 +8,7 @@ import httpx
 import uuid
 import asyncio
 import os
+import json
 from datetime import datetime, timezone
 
 from modules.common.config import VERIFY_TOKEN
@@ -18,6 +19,10 @@ from modules.ai.orchestrated_processor import OrchestratedProcessor
 from modules.ai.rule_processor import get_rule_reply
 from modules.message.sender import send_whatsapp_text, get_whatsapp_config, WhatsAppService
 from modules.common.logger import get_logger
+
+# Phase 4 imports
+from modules.ai.bot_config_loader import get_active_bot_config
+from modules.ai.generic_bot_engine import GenericBotEngine
 
 # Lead capture imports
 from modules.ai.lead_extractor import extract_lead_from_conversation
@@ -35,8 +40,113 @@ from modules.tasks.message_tasks import process_message_task
 logger = get_logger(__name__)
 router = APIRouter(prefix="/webhook", tags=["WhatsApp"])
 USE_ORCHESTRATION = os.getenv("USE_ORCHESTRATION", "false").lower() == "true"
+USE_GENERIC_BOT = os.getenv("USE_GENERIC_BOT", "false").lower() == "true"
 
+# ========== Phase 9: Gradual Rollout (Whitelist) ==========
+GENERIC_BOT_ORG_WHITELIST = os.getenv("GENERIC_BOT_ORG_IDS", "")
+WHITELIST_ORGS = set(GENERIC_BOT_ORG_WHITELIST.split(",")) if GENERIC_BOT_ORG_WHITELIST else set()
 
+def is_generic_enabled_for_org(org_id: str) -> bool:
+    """Check if generic bot should be used for this organisation."""
+    if WHITELIST_ORGS:
+        return org_id in WHITELIST_ORGS
+    return USE_GENERIC_BOT
+
+# ========== Phase 9: Optional metrics helper (uncomment if Redis available) ==========
+# async def increment_metric(org_id: str, metric_name: str):
+#     from modules.common.redis_client import get_redis_client
+#     try:
+#         redis = get_redis_client()
+#         today = datetime.utcnow().strftime("%Y-%m-%d")
+#         key = f"bot_metrics:{org_id}:{metric_name}:{today}"
+#         await redis.incr(key)
+#         await redis.expire(key, 86400*7)
+#     except Exception as e:
+#         logger.warning(f"Metric increment failed: {e}")
+
+# ========== Helper: send interactive message ==========
+async def send_whatsapp_interactive(to_number: str, question: str, options: list, org_id: str) -> tuple:
+    """Send an interactive message (buttons or list) using WhatsApp Cloud API."""
+    config = await get_whatsapp_config(org_id)
+    if not config:
+        logger.error(f"No WhatsApp config for org {org_id}")
+        return False, None
+
+    wa = WhatsAppService(config['access_token'], config['phone_number_id'])
+    if len(options) <= 3:
+        buttons = [{"type": "reply", "reply": {"id": opt["id"], "title": opt["title"][:20]}} for opt in options]
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to_number,
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {"text": question[:1024]},
+                "action": {"buttons": buttons}
+            }
+        }
+    else:
+        rows = [{"id": opt["id"], "title": opt["title"][:24], "description": opt.get("description", "")[:60]} for opt in options]
+        payload = {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": to_number,
+            "type": "interactive",
+            "interactive": {
+                "type": "list",
+                "body": {"text": question[:1024]},
+                "action": {
+                    "button": "Select",
+                    "sections": [{"title": "Options", "rows": rows}]
+                }
+            }
+        }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"https://graph.facebook.com/v18.0/{wa.phone_number_id}/messages",
+            headers={"Authorization": f"Bearer {wa.access_token}"},
+            json=payload
+        )
+        if resp.status_code == 201:
+            data = resp.json()
+            wamid = data.get("messages", [{}])[0].get("id")
+            return True, wamid
+        else:
+            logger.error(f"Interactive send failed: {resp.status_code} {resp.text}")
+            return False, None
+
+# ========== Helper: create lead from generic bot ==========
+async def create_lead_from_generic_bot(org_id: str, conversation_id: str, customer_phone: str, responses: dict):
+    """Create a lead using the fields collected by the generic bot."""
+    try:
+        customer_name = responses.get("name") or responses.get("customer_name") or ""
+        email = responses.get("email") or ""
+        phone = responses.get("phone") or customer_phone
+        lead = Lead(
+            id=uuid.uuid4(),
+            organization_id=uuid.UUID(org_id),
+            conversation_id=uuid.UUID(conversation_id),
+            customer_phone=phone,
+            customer_name=customer_name,
+            email=email,
+            status="new",
+            lead_score=70,
+            conversion_probability=0.5,
+            created_at=datetime.utcnow()
+        )
+        if hasattr(lead, 'data'):
+            lead.data = responses
+        async with AsyncSessionLocal() as session:
+            session.add(lead)
+            await session.commit()
+            logger.info(f"Lead created from generic bot for conversation {conversation_id}")
+            return lead.id
+    except Exception as e:
+        logger.error(f"Failed to create lead from generic bot: {e}", exc_info=True)
+        return None
+
+# ========== Existing helper functions (unchanged) ==========
 async def download_media_background(
     message_id: uuid.UUID,
     media_id: str,
@@ -171,7 +281,7 @@ async def get_or_create_lead(session: AsyncSession, conversation: Conversation, 
             session.add(lead)
     return lead
 
-
+# ========== Webhook endpoints ==========
 @router.get("")
 async def verify_webhook(
     hub_mode: str = None,
@@ -202,24 +312,18 @@ async def receive_webhook(
         changes = entry["changes"][0]
         value = changes["value"]
 
-        # ---------- Handle Status Updates (UPDATES existing message) ----------
+        # ---------- Handle Status Updates ----------
         if "statuses" in value:
             statuses = value["statuses"]
             for status_data in statuses:
                 wamid = status_data.get("id")
-                status = status_data.get("status")  # "sent", "delivered", "read", "failed"
+                status = status_data.get("status")
                 if not wamid:
-                    logger.warning("Status update missing message ID")
                     continue
-
                 stmt = update(Message).where(Message.whatsapp_message_id == wamid).values(status=status)
-                result = await db.execute(stmt)
+                await db.execute(stmt)
                 await db.commit()
-
-                if result.rowcount == 0:
-                    logger.warning(f"No message found for status update: wamid={wamid}, status={status}")
-                else:
-                    logger.info(f"Updated message {wamid} status to {status}")
+                logger.info(f"Updated message {wamid} status to {status}")
 
         # ---------- Handle Incoming Messages ----------
         if "messages" in value:
@@ -237,7 +341,7 @@ async def receive_webhook(
             content = ""
             message_type = "text"
 
-            # ----- NEW: Handle interactive replies -----
+            # Handle interactive replies
             if "interactive" in msg_data:
                 interactive = msg_data["interactive"]
                 if interactive["type"] == "button_reply":
@@ -246,8 +350,7 @@ async def receive_webhook(
                     content = interactive["list_reply"]["id"]
                 else:
                     content = ""
-                message_type = "text"  # treat as text for storage
-                # Skip regular parsing below
+                message_type = "text"
             else:
                 if msg_type == "text":
                     content = msg_data["text"]["body"]
@@ -304,10 +407,9 @@ async def receive_webhook(
                 if conv.reply_mode is None:
                     conv.reply_mode = 'ai'
 
-            # Create message record with upsert (handles webhook retries)
+            # Create message record (upsert)
             new_message_id = uuid.uuid4()
             sort_ts = datetime.fromtimestamp(timestamp, tz=timezone.utc)
-
             insert_stmt = pg_insert(Message).values(
                 id=new_message_id,
                 conversation_id=conv.id,
@@ -326,7 +428,6 @@ async def receive_webhook(
                 whatsapp_timestamp=timestamp,
                 sort_timestamp=sort_ts
             )
-
             upsert_stmt = insert_stmt.on_conflict_do_update(
                 index_elements=['whatsapp_message_id'],
                 set_={
@@ -338,10 +439,9 @@ async def receive_webhook(
                     'media_content_type': media_content_type
                 }
             )
-            
             await db.execute(upsert_stmt)
 
-            # Update conversation stats (since direction is inbound, we increment unread count)
+            # Update conversation stats
             naive_utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
             await db.execute(
                 update(Conversation)
@@ -353,11 +453,9 @@ async def receive_webhook(
                 )
             )
 
-            # Create or link Lead (basic lead, may be updated later by AI or rule capture)
             lead = await get_or_create_lead(db, conv, from_number)
             await db.commit()
 
-            # Schedule media download if needed
             if media_whatsapp_id:
                 background_tasks.add_task(
                     download_media_background,
@@ -369,7 +467,6 @@ async def receive_webhook(
                     media_content_type or "application/octet-stream"
                 )
 
-            # Schedule ML processing (scoring, sentiment, etc.)
             background_tasks.add_task(
                 process_lead_ml_background,
                 lead.id,
@@ -377,133 +474,209 @@ async def receive_webhook(
                 content
             )
 
-            # ---------- Rule/AI reply handling ----------
+            # ---------- REPLY LOGIC ----------
             if conv.reply_mode == 'rule':
-                # Get rule reply and the updated conversation state
-                reply, updated_state = await get_rule_reply(str(org_id), str(conv.id), content, from_number)
-                
-                # ✅ CRITICAL FIX: Persist the updated state (including interactive_map) after every rule processing
-                if updated_state:
-                    await db.execute(
-                        update(Conversation)
-                        .where(Conversation.id == conv.id)
-                        .values(rule_state=updated_state)
-                    )
-                    await db.commit()
-                
-                if reply == "__INTERACTIVE__":
-                    # Interactive message already sent; state already saved above
-                    return {"status": "ok"}
+                generic_used = False
+                # Use gradual rollout check (Phase 9)
+                if is_generic_enabled_for_org(str(org_id)):
+                    active_config = await get_active_bot_config(str(org_id))
+                    if active_config:
+                        logger.info(f"Using GenericBotEngine for org {org_id}, conv {conv.id}")
+                        # Log structured event for metrics
+                        logger.info(json.dumps({
+                            "event": "generic_bot_used",
+                            "org_id": str(org_id),
+                            "conversation_id": str(conv.id)
+                        }))
+                        engine = GenericBotEngine(active_config)
+                        current_state = conv.rule_state or {}
+                        try:
+                            action = engine.process(content, current_state)
+                            generic_used = True
+                        except Exception as e:
+                            logger.exception(f"Generic bot engine error: {e}")
+                            action = None
+                            generic_used = False
 
-                if reply:
-                    # Prevent rapid duplicate outbound replies: check last outbound message
-                    last_out_stmt = select(Message).where(
-                        Message.conversation_id == conv.id,
-                        Message.direction == "outbound"
-                    ).order_by(Message.sort_timestamp.desc()).limit(1)
-                    last_out = (await db.execute(last_out_stmt)).scalar_one_or_none()
-                    send_reply = True
-                    if last_out and last_out.content == reply:
-                        # If the last outbound message is identical and was sent very recently, skip
-                        delta = datetime.now(timezone.utc) - last_out.created_at
-                        if delta.total_seconds() < 5:
-                            logger.info(f"Skipping duplicate outbound reply to {from_number}")
-                            send_reply = False
+                        if action:
+                            new_state = action.get("new_state", current_state)
+                            if new_state != current_state:
+                                conv.rule_state = new_state
+                                await db.execute(
+                                    update(Conversation)
+                                    .where(Conversation.id == conv.id)
+                                    .values(rule_state=new_state)
+                                )
+                                await db.commit()
 
-                    if send_reply:
-                        # Send the rule reply immediately
-                        success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=str(org_id))
-                    else:
-                        success = False
-                        wamid = None
-                    if success:
-                        now_utc = datetime.now(timezone.utc)
-                        out_msg = Message(
-                            id=uuid.uuid4(),
-                            conversation_id=conv.id,
-                            direction="outbound",
-                            content=reply,
-                            is_ai_generated=False,
-                            status="sent",
-                            created_at=now_utc,
-                            whatsapp_message_id=wamid,
-                            whatsapp_timestamp=int(now_utc.timestamp()),
-                            sort_timestamp=now_utc
-                        )
-                        db.add(out_msg)
+                            action_type = action["action"]
+                            data = action.get("data", {})
+
+                            # Log action for monitoring
+                            logger.info(f"Generic bot action: {action_type} for conv {conv.id}")
+
+                            if action_type == "ask":
+                                question = data["question"]
+                                field_type = data.get("field_type", "text")
+                                options = data.get("options", [])
+                                if field_type in ["button", "list"] and options:
+                                    success, wamid = await send_whatsapp_interactive(
+                                        from_number, question, options, str(org_id)
+                                    )
+                                else:
+                                    success, wamid = await send_whatsapp_text(from_number, question, str(org_id))
+                                if success:
+                                    out_msg = Message(
+                                        id=uuid.uuid4(),
+                                        conversation_id=conv.id,
+                                        direction="outbound",
+                                        content=question,
+                                        is_ai_generated=True,
+                                        status="sent",
+                                        created_at=datetime.now(timezone.utc),
+                                        whatsapp_message_id=wamid,
+                                        whatsapp_timestamp=int(datetime.now(timezone.utc).timestamp()),
+                                        sort_timestamp=datetime.now(timezone.utc)
+                                    )
+                                    db.add(out_msg)
+                                    await db.commit()
+                                return {"status": "ok"}
+
+                            elif action_type in ["validation_error", "invalid_field", "confirmation_invalid"]:
+                                error_msg = data.get("error") or data.get("message") or "Invalid input"
+                                await send_whatsapp_text(from_number, error_msg, str(org_id))
+                                return {"status": "ok"}
+
+                            elif action_type == "ask_confirmation":
+                                await send_whatsapp_text(from_number, data["message"], str(org_id))
+                                return {"status": "ok"}
+
+                            elif action_type == "ask_which_field":
+                                fields = ", ".join(data["fields"])
+                                await send_whatsapp_text(from_number, f"Which field would you like to change? ({fields})", str(org_id))
+                                return {"status": "ok"}
+
+                            elif action_type == "ask_new_value":
+                                await send_whatsapp_text(from_number, f"Please provide the new value for {data['field']}:", str(org_id))
+                                return {"status": "ok"}
+
+                            elif action_type == "create_lead":
+                                await create_lead_from_generic_bot(str(org_id), str(conv.id), from_number, data)
+                                await send_whatsapp_text(from_number, "Thank you! Your information has been saved.", str(org_id))
+                                # Optional metric: await increment_metric(str(org_id), "lead_created")
+                                return {"status": "ok"}
+
+                # Fallback to existing rule engine
+                if not generic_used:
+                    logger.info(f"Fallback to rule engine for org {org_id}")
+                    reply, updated_state = await get_rule_reply(str(org_id), str(conv.id), content, from_number)
+                    if updated_state:
                         await db.execute(
                             update(Conversation)
                             .where(Conversation.id == conv.id)
-                            .values(last_message_at=now_utc)
+                            .values(rule_state=updated_state)
                         )
                         await db.commit()
-                        logger.info(f"Rule-based reply sent to {from_number}")
-
-                    # LEAD CAPTURE in rule mode (silent, does not affect the reply)
-                    try:
-                        schema_result = await db.execute(
-                            select(LeadSchema)
-                            .where(LeadSchema.organization_id == org_id, LeadSchema.is_active == True)
-                            .order_by(LeadSchema.updated_at.desc())
-                        )
-                        lead_schema = schema_result.scalars().first()
-
-                        if lead_schema:
-                            msg_result = await db.execute(
-                                select(Message)
-                                .where(Message.conversation_id == conv.id)
-                                .order_by(Message.sort_timestamp.asc())
-                                .limit(5)
+                    if reply == "__INTERACTIVE__":
+                        return {"status": "ok"}
+                    if reply:
+                        last_out_stmt = select(Message).where(
+                            Message.conversation_id == conv.id,
+                            Message.direction == "outbound"
+                        ).order_by(Message.sort_timestamp.desc()).limit(1)
+                        last_out = (await db.execute(last_out_stmt)).scalar_one_or_none()
+                        send_reply = True
+                        if last_out and last_out.content == reply:
+                            delta = datetime.now(timezone.utc) - last_out.created_at
+                            if delta.total_seconds() < 5:
+                                logger.info(f"Skipping duplicate outbound reply to {from_number}")
+                                send_reply = False
+                        if send_reply:
+                            success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=str(org_id))
+                        else:
+                            success = False
+                            wamid = None
+                        if success:
+                            now_utc = datetime.now(timezone.utc)
+                            out_msg = Message(
+                                id=uuid.uuid4(),
+                                conversation_id=conv.id,
+                                direction="outbound",
+                                content=reply,
+                                is_ai_generated=False,
+                                status="sent",
+                                created_at=now_utc,
+                                whatsapp_message_id=wamid,
+                                whatsapp_timestamp=int(now_utc.timestamp()),
+                                sort_timestamp=now_utc
                             )
-                            history_messages = msg_result.scalars().all()
-                            history = [
-                                {"role": "assistant" if msg.direction == "outbound" else "customer", "text": msg.content or ""}
-                                for msg in history_messages
-                            ]
-                            if not history or history[-1]["text"] != content:
-                                history.append({"role": "customer", "text": content})
-
-                            extracted_data = await extract_lead_from_conversation(
-                                history,
-                                lead_schema.schema_fields or [],
-                                lead_schema.extraction_prompt
+                            db.add(out_msg)
+                            await db.execute(
+                                update(Conversation)
+                                .where(Conversation.id == conv.id)
+                                .values(last_message_at=now_utc)
                             )
-
-                            if extracted_data:
-                                await create_lead(
-                                    org_id=str(org_id),
-                                    customer_phone=from_number,
-                                    extracted_data=extracted_data,
-                                    schema_id=str(lead_schema.id),
-                                    conversation_id=str(conv.id),
-                                    customer_name=extracted_data.get("name", ""),
-                                    lead_score=extracted_data.get("lead_score", 70),
-                                    interest=extracted_data.get("interest", ""),
-                                    service=extracted_data.get("service", ""),
-                                    urgency=extracted_data.get("urgency", "medium"),
-                                    intent=extracted_data.get("intent", "general"),
-                                    sentiment=extracted_data.get("sentiment", "neutral"),
-                                    conversion_probability=extracted_data.get("conversion_probability", 0.0),
-                                    follow_up_scheduled_at=extracted_data.get("follow_up_scheduled_at"),
-                                    lead_stage=extracted_data.get("lead_stage", "new"),
-                                    rule_state=extracted_data.get("rule_state", {})
+                            await db.commit()
+                            logger.info(f"Rule-based reply sent to {from_number}")
+                        # Lead capture in rule mode (existing code)
+                        try:
+                            schema_result = await db.execute(
+                                select(LeadSchema)
+                                .where(LeadSchema.organization_id == org_id, LeadSchema.is_active == True)
+                                .order_by(LeadSchema.updated_at.desc())
+                            )
+                            lead_schema = schema_result.scalars().first()
+                            if lead_schema:
+                                msg_result = await db.execute(
+                                    select(Message)
+                                    .where(Message.conversation_id == conv.id)
+                                    .order_by(Message.sort_timestamp.asc())
+                                    .limit(5)
                                 )
-                                logger.info(f"Lead captured in rule mode")
-                    except Exception as e:
-                        logger.error(f"Lead capture in rule mode failed: {e}", exc_info=True)
-
-                    return {"status": "ok"}
-                else:
-                    # No rule matched – fall back to AI mode
-                    logger.info(f"No rule matched, falling back to AI mode")
-                    conv.reply_mode = 'ai'
-                    await db.commit()
+                                history_messages = msg_result.scalars().all()
+                                history = [
+                                    {"role": "assistant" if msg.direction == "outbound" else "customer", "text": msg.content or ""}
+                                    for msg in history_messages
+                                ]
+                                if not history or history[-1]["text"] != content:
+                                    history.append({"role": "customer", "text": content})
+                                extracted_data = await extract_lead_from_conversation(
+                                    history,
+                                    lead_schema.schema_fields or [],
+                                    lead_schema.extraction_prompt
+                                )
+                                if extracted_data:
+                                    await create_lead(
+                                        org_id=str(org_id),
+                                        customer_phone=from_number,
+                                        extracted_data=extracted_data,
+                                        schema_id=str(lead_schema.id),
+                                        conversation_id=str(conv.id),
+                                        customer_name=extracted_data.get("name", ""),
+                                        lead_score=extracted_data.get("lead_score", 70),
+                                        interest=extracted_data.get("interest", ""),
+                                        service=extracted_data.get("service", ""),
+                                        urgency=extracted_data.get("urgency", "medium"),
+                                        intent=extracted_data.get("intent", "general"),
+                                        sentiment=extracted_data.get("sentiment", "neutral"),
+                                        conversion_probability=extracted_data.get("conversion_probability", 0.0),
+                                        follow_up_scheduled_at=extracted_data.get("follow_up_scheduled_at"),
+                                        lead_stage=extracted_data.get("lead_stage", "new"),
+                                        rule_state=extracted_data.get("rule_state", {})
+                                    )
+                                    logger.info(f"Lead captured in rule mode")
+                        except Exception as e:
+                            logger.error(f"Lead capture in rule mode failed: {e}", exc_info=True)
+                        return {"status": "ok"}
+                    else:
+                        logger.info(f"No rule matched, falling back to AI mode")
+                        conv.reply_mode = 'ai'
+                        await db.commit()
 
             if conv.reply_mode == 'human':
                 logger.info(f"Conversation {conv.id} in human mode – skipping AI reply")
                 return {"status": "ok"}
             else:
-                # Use Feature Flag to choose processor
                 if USE_ORCHESTRATION:
                     logger.info(f"Using ORCHESTRATED processor for {from_number}")
                     background_tasks.add_task(

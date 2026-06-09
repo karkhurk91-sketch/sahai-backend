@@ -76,6 +76,7 @@ class GenericBotEngine:
         }
         Returns action dict with keys: "action", "data"
         """
+
         responses = state.get("responses", {})
         awaiting_confirmation = state.get("awaiting_confirmation", False)
         correction_mode = state.get("correction_mode", False)

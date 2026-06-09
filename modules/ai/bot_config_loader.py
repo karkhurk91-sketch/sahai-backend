@@ -2,7 +2,7 @@
 import json
 import logging
 from typing import Optional, Dict
-from sqlalchemy import select, text
+from sqlalchemy import select
 from modules.common.database import AsyncSessionLocal
 from modules.common.models import BotConfig
 from modules.common.redis_client import get_redis_client
@@ -30,10 +30,11 @@ async def get_active_bot_config(org_id: str) -> Optional[Dict]:
             select(BotConfig.config)
             .where(BotConfig.organization_id == org_id, BotConfig.is_active == True)
             .order_by(BotConfig.updated_at.desc())
+            .limit(1)   # 👈 FIX: ensure only one row
         )
         config = result.scalar_one_or_none()
         if config:
-            # Cache for 5 minutes (adjust TTL as needed)
+            # Cache for 5 minutes
             try:
                 await redis_client.setex(cache_key, 300, json.dumps(config))
             except Exception as e:

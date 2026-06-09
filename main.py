@@ -43,6 +43,8 @@ from modules.partners import router as partners_router
 from modules.team import router as team_router
 from modules.whatsapp_templates import router as whatsapp_templates_router
 from modules.broadcast.groups_routes import router as broadcast_groups_router
+from modules.bot_builder.routes import router as bot_builder_router
+
 
 logger = get_logger(__name__)
 app = FastAPI(title=APP_NAME)
@@ -115,6 +117,7 @@ app.include_router(partners_router)
 app.include_router(team_router)
 app.include_router(whatsapp_templates_router)
 app.include_router(broadcast_groups_router)
+app.include_router(bot_builder_router)
 
 
 
