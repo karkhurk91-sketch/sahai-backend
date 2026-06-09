@@ -777,3 +777,28 @@ async def update_customer_optin(
     except Exception as e:
         logger.error(f"Error updating opt-in: {e}")
         raise HTTPException(500, "Internal server error")
+
+@router.patch("/{conv_id}/mode")
+async def set_conversation_mode(
+    conv_id: UUID,
+    mode: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Change conversation reply mode: ai, human, rule, bot"""
+    conv = await db.get(Conversation, conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    
+    # Check user has access to the organisation
+    user_org_id = current_user.get("org_id")
+    user_role = current_user.get("role")
+    if user_role != "super_admin" and str(conv.organization_id) != user_org_id:
+        raise HTTPException(403, "Access denied")
+    
+    if mode not in ["ai", "human", "rule", "bot"]:
+        raise HTTPException(400, "Invalid mode. Allowed: ai, human, rule, bot")
+    
+    conv.reply_mode = mode
+    await db.commit()
+    return {"message": f"Conversation mode changed to {mode}", "reply_mode": mode}
