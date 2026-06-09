@@ -487,3 +487,21 @@ class ConversationMemory(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     # Relationships
     conversation = relationship("Conversation", backref="memories")
+
+
+class BotConfig(Base):
+    __tablename__ = "bot_configs"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    config = Column(JSON, nullable=False)           # full bot definition (fields, messages, etc.)
+    version = Column(Integer, nullable=False, default=1)
+    is_active = Column(Boolean, default=False)      # only one active per organisation
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_bot_configs_org_active", "organization_id", "is_active"),
+    )
