@@ -40,19 +40,19 @@ from modules.tasks.message_tasks import process_message_task
 logger = get_logger(__name__)
 router = APIRouter(prefix="/webhook", tags=["WhatsApp"])
 USE_ORCHESTRATION = os.getenv("USE_ORCHESTRATION", "false").lower() == "true"
-USE_GENERIC_BOT = os.getenv("USE_GENERIC_BOT", "false").lower() == "true"
 
-# ========== Phase 9: Gradual Rollout (Whitelist) ==========
+# ========== Phase 9: Gradual Rollout for Bot Mode ==========
+USE_GENERIC_BOT = os.getenv("USE_GENERIC_BOT", "false").lower() == "true"
 GENERIC_BOT_ORG_WHITELIST = os.getenv("GENERIC_BOT_ORG_IDS", "")
 WHITELIST_ORGS = set(GENERIC_BOT_ORG_WHITELIST.split(",")) if GENERIC_BOT_ORG_WHITELIST else set()
 
 def is_generic_enabled_for_org(org_id: str) -> bool:
-    """Check if generic bot should be used for this organisation."""
+    """Check if generic bot should be used for this organisation (bot mode only)."""
     if WHITELIST_ORGS:
         return org_id in WHITELIST_ORGS
     return USE_GENERIC_BOT
 
-# ========== Phase 9: Optional metrics helper (uncomment if Redis available) ==========
+# ========== Optional metrics helper (uncomment if Redis available) ==========
 # async def increment_metric(org_id: str, metric_name: str):
 #     from modules.common.redis_client import get_redis_client
 #     try:
@@ -475,14 +475,130 @@ async def receive_webhook(
             )
 
             # ---------- REPLY LOGIC ----------
+            # 1. OLD RULE ENGINE (industry‑specific, hardcoded)
             if conv.reply_mode == 'rule':
-                generic_used = False
-                # Use gradual rollout check (Phase 9)
-                if is_generic_enabled_for_org(str(org_id)):
+                logger.info(f"Using rule engine for org {org_id}, conv {conv.id}")
+                reply, updated_state = await get_rule_reply(str(org_id), str(conv.id), content, from_number)
+                if updated_state:
+                    conv.rule_state = updated_state
+                    await db.execute(
+                        update(Conversation)
+                        .where(Conversation.id == conv.id)
+                        .values(rule_state=updated_state)
+                    )
+                    await db.commit()
+                if reply == "__INTERACTIVE__":
+                    return {"status": "ok"}
+                if reply:
+                    last_out_stmt = select(Message).where(
+                        Message.conversation_id == conv.id,
+                        Message.direction == "outbound"
+                    ).order_by(Message.sort_timestamp.desc()).limit(1)
+                    last_out = (await db.execute(last_out_stmt)).scalar_one_or_none()
+                    send_reply = True
+                    if last_out and last_out.content == reply:
+                        delta = datetime.now(timezone.utc) - last_out.created_at
+                        if delta.total_seconds() < 5:
+                            logger.info(f"Skipping duplicate outbound reply to {from_number}")
+                            send_reply = False
+                    if send_reply:
+                        success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=str(org_id))
+                    else:
+                        success = False
+                        wamid = None
+                    if success:
+                        now_utc = datetime.now(timezone.utc)
+                        out_msg = Message(
+                            id=uuid.uuid4(),
+                            conversation_id=conv.id,
+                            direction="outbound",
+                            content=reply,
+                            is_ai_generated=False,
+                            status="sent",
+                            created_at=now_utc,
+                            whatsapp_message_id=wamid,
+                            whatsapp_timestamp=int(now_utc.timestamp()),
+                            sort_timestamp=now_utc
+                        )
+                        db.add(out_msg)
+                        await db.execute(
+                            update(Conversation)
+                            .where(Conversation.id == conv.id)
+                            .values(last_message_at=now_utc)
+                        )
+                        await db.commit()
+                        logger.info(f"Rule-based reply sent to {from_number}")
+                    # Lead capture in rule mode (existing)
+                    try:
+                        schema_result = await db.execute(
+                            select(LeadSchema)
+                            .where(LeadSchema.organization_id == org_id, LeadSchema.is_active == True)
+                            .order_by(LeadSchema.updated_at.desc())
+                        )
+                        lead_schema = schema_result.scalars().first()
+                        if lead_schema:
+                            msg_result = await db.execute(
+                                select(Message)
+                                .where(Message.conversation_id == conv.id)
+                                .order_by(Message.sort_timestamp.asc())
+                                .limit(5)
+                            )
+                            history_messages = msg_result.scalars().all()
+                            history = [
+                                {"role": "assistant" if msg.direction == "outbound" else "customer", "text": msg.content or ""}
+                                for msg in history_messages
+                            ]
+                            if not history or history[-1]["text"] != content:
+                                history.append({"role": "customer", "text": content})
+                            extracted_data = await extract_lead_from_conversation(
+                                history,
+                                lead_schema.schema_fields or [],
+                                lead_schema.extraction_prompt
+                            )
+                            if extracted_data:
+                                await create_lead(
+                                    org_id=str(org_id),
+                                    customer_phone=from_number,
+                                    extracted_data=extracted_data,
+                                    schema_id=str(lead_schema.id),
+                                    conversation_id=str(conv.id),
+                                    customer_name=extracted_data.get("name", ""),
+                                    lead_score=extracted_data.get("lead_score", 70),
+                                    interest=extracted_data.get("interest", ""),
+                                    service=extracted_data.get("service", ""),
+                                    urgency=extracted_data.get("urgency", "medium"),
+                                    intent=extracted_data.get("intent", "general"),
+                                    sentiment=extracted_data.get("sentiment", "neutral"),
+                                    conversion_probability=extracted_data.get("conversion_probability", 0.0),
+                                    follow_up_scheduled_at=extracted_data.get("follow_up_scheduled_at"),
+                                    lead_stage=extracted_data.get("lead_stage", "new"),
+                                    rule_state=extracted_data.get("rule_state", {})
+                                )
+                                logger.info(f"Lead captured in rule mode")
+                    except Exception as e:
+                        logger.error(f"Lead capture in rule mode failed: {e}", exc_info=True)
+                    return {"status": "ok"}
+                else:
+                    # No rule matched -> fall back to AI mode
+                    logger.info(f"No rule matched, falling back to AI mode")
+                    conv.reply_mode = 'ai'
+                    await db.commit()
+                    # Continue to AI processing below (not reached due to return, but we let it fall through)
+            # 2. NEW GENERIC BOT ENGINE (JSON‑driven)
+            elif conv.reply_mode == 'bot':
+                # Check if generic bot is allowed for this organisation
+                if not is_generic_enabled_for_org(str(org_id)):
+                    logger.warning(f"Bot mode enabled but generic bot not allowed for org {org_id}. Falling back to AI.")
+                    conv.reply_mode = 'ai'
+                    await db.commit()
+                else:
                     active_config = await get_active_bot_config(str(org_id))
-                    if active_config:
+                    if not active_config:
+                        logger.warning(f"Bot mode enabled but no active config for org {org_id}. Falling back to AI.")
+                        conv.reply_mode = 'ai'
+                        await db.commit()
+                    else:
                         logger.info(f"Using GenericBotEngine for org {org_id}, conv {conv.id}")
-                        # Log structured event for metrics
                         logger.info(json.dumps({
                             "event": "generic_bot_used",
                             "org_id": str(org_id),
@@ -492,11 +608,14 @@ async def receive_webhook(
                         current_state = conv.rule_state or {}
                         try:
                             action = engine.process(content, current_state)
-                            generic_used = True
                         except Exception as e:
                             logger.exception(f"Generic bot engine error: {e}")
+                            # On error, fall back to AI mode
+                            conv.reply_mode = 'ai'
+                            await db.commit()
+                            # Continue to AI processing below
+                            # We'll let the code fall through to AI mode (do not return)
                             action = None
-                            generic_used = False
 
                         if action:
                             new_state = action.get("new_state", current_state)
@@ -512,7 +631,6 @@ async def receive_webhook(
                             action_type = action["action"]
                             data = action.get("data", {})
 
-                            # Log action for monitoring
                             logger.info(f"Generic bot action: {action_type} for conv {conv.id}")
 
                             if action_type == "ask":
@@ -566,117 +684,14 @@ async def receive_webhook(
                                 # Optional metric: await increment_metric(str(org_id), "lead_created")
                                 return {"status": "ok"}
 
-                # Fallback to existing rule engine
-                if not generic_used:
-                    logger.info(f"Fallback to rule engine for org {org_id}")
-                    reply, updated_state = await get_rule_reply(str(org_id), str(conv.id), content, from_number)
-                    if updated_state:
-                        await db.execute(
-                            update(Conversation)
-                            .where(Conversation.id == conv.id)
-                            .values(rule_state=updated_state)
-                        )
-                        await db.commit()
-                    if reply == "__INTERACTIVE__":
-                        return {"status": "ok"}
-                    if reply:
-                        last_out_stmt = select(Message).where(
-                            Message.conversation_id == conv.id,
-                            Message.direction == "outbound"
-                        ).order_by(Message.sort_timestamp.desc()).limit(1)
-                        last_out = (await db.execute(last_out_stmt)).scalar_one_or_none()
-                        send_reply = True
-                        if last_out and last_out.content == reply:
-                            delta = datetime.now(timezone.utc) - last_out.created_at
-                            if delta.total_seconds() < 5:
-                                logger.info(f"Skipping duplicate outbound reply to {from_number}")
-                                send_reply = False
-                        if send_reply:
-                            success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=str(org_id))
-                        else:
-                            success = False
-                            wamid = None
-                        if success:
-                            now_utc = datetime.now(timezone.utc)
-                            out_msg = Message(
-                                id=uuid.uuid4(),
-                                conversation_id=conv.id,
-                                direction="outbound",
-                                content=reply,
-                                is_ai_generated=False,
-                                status="sent",
-                                created_at=now_utc,
-                                whatsapp_message_id=wamid,
-                                whatsapp_timestamp=int(now_utc.timestamp()),
-                                sort_timestamp=now_utc
-                            )
-                            db.add(out_msg)
-                            await db.execute(
-                                update(Conversation)
-                                .where(Conversation.id == conv.id)
-                                .values(last_message_at=now_utc)
-                            )
-                            await db.commit()
-                            logger.info(f"Rule-based reply sent to {from_number}")
-                        # Lead capture in rule mode (existing code)
-                        try:
-                            schema_result = await db.execute(
-                                select(LeadSchema)
-                                .where(LeadSchema.organization_id == org_id, LeadSchema.is_active == True)
-                                .order_by(LeadSchema.updated_at.desc())
-                            )
-                            lead_schema = schema_result.scalars().first()
-                            if lead_schema:
-                                msg_result = await db.execute(
-                                    select(Message)
-                                    .where(Message.conversation_id == conv.id)
-                                    .order_by(Message.sort_timestamp.asc())
-                                    .limit(5)
-                                )
-                                history_messages = msg_result.scalars().all()
-                                history = [
-                                    {"role": "assistant" if msg.direction == "outbound" else "customer", "text": msg.content or ""}
-                                    for msg in history_messages
-                                ]
-                                if not history or history[-1]["text"] != content:
-                                    history.append({"role": "customer", "text": content})
-                                extracted_data = await extract_lead_from_conversation(
-                                    history,
-                                    lead_schema.schema_fields or [],
-                                    lead_schema.extraction_prompt
-                                )
-                                if extracted_data:
-                                    await create_lead(
-                                        org_id=str(org_id),
-                                        customer_phone=from_number,
-                                        extracted_data=extracted_data,
-                                        schema_id=str(lead_schema.id),
-                                        conversation_id=str(conv.id),
-                                        customer_name=extracted_data.get("name", ""),
-                                        lead_score=extracted_data.get("lead_score", 70),
-                                        interest=extracted_data.get("interest", ""),
-                                        service=extracted_data.get("service", ""),
-                                        urgency=extracted_data.get("urgency", "medium"),
-                                        intent=extracted_data.get("intent", "general"),
-                                        sentiment=extracted_data.get("sentiment", "neutral"),
-                                        conversion_probability=extracted_data.get("conversion_probability", 0.0),
-                                        follow_up_scheduled_at=extracted_data.get("follow_up_scheduled_at"),
-                                        lead_stage=extracted_data.get("lead_stage", "new"),
-                                        rule_state=extracted_data.get("rule_state", {})
-                                    )
-                                    logger.info(f"Lead captured in rule mode")
-                        except Exception as e:
-                            logger.error(f"Lead capture in rule mode failed: {e}", exc_info=True)
-                        return {"status": "ok"}
-                    else:
-                        logger.info(f"No rule matched, falling back to AI mode")
-                        conv.reply_mode = 'ai'
-                        await db.commit()
-
+            # 3. HUMAN MODE – no reply
             if conv.reply_mode == 'human':
                 logger.info(f"Conversation {conv.id} in human mode – skipping AI reply")
                 return {"status": "ok"}
-            else:
+
+            # 4. AI MODE (fallback for any other mode, including when bot/rule fallbacks happen)
+            # This also covers the case where reply_mode is 'ai' initially
+            if conv.reply_mode in ['ai', None] or (conv.reply_mode == 'bot' and not action):
                 if USE_ORCHESTRATION:
                     logger.info(f"Using ORCHESTRATED processor for {from_number}")
                     background_tasks.add_task(
