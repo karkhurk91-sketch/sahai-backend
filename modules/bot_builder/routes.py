@@ -14,6 +14,8 @@ from modules.bot_builder.schemas import (
     BotConfigListResponse
 )
 from modules.common.logger import get_logger
+from modules.bot_builder.analytics import router as analytics_router
+
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/bots", tags=["Bot Builder"])
