@@ -37,7 +37,6 @@ from modules.websocket import send_alert
 from modules.tasks.message_tasks import process_message_task
 from modules.websocket import manager
 
-
 logger = get_logger(__name__)
 router = APIRouter(prefix="/webhook", tags=["WhatsApp"])
 USE_ORCHESTRATION = os.getenv("USE_ORCHESTRATION", "false").lower() == "true"
@@ -54,7 +53,6 @@ def is_generic_enabled_for_org(org_id: str) -> bool:
 
 # ========== Phase 18: Voice Transcription ==========
 async def transcribe_voice_note(audio_url: str, access_token: str) -> str:
-    """Download audio and transcribe using Groq Whisper."""
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(audio_url, headers={"Authorization": f"Bearer {access_token}"})
@@ -221,7 +219,7 @@ async def get_ai_fallback_reply(org_id: str, user_input: str, current_question: 
     return (f"I understand you're asking: '{user_input}'. "
             f"Could you please answer the question: '{current_question}'?")
 
-# ========== Original helpers (unchanged) ==========
+# ========== Original helpers ==========
 async def download_media_background(
     message_id: uuid.UUID,
     media_id: str,
@@ -377,16 +375,20 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                 if not wamid:
                     continue
                 
-                # Get optional timestamp from webhook
                 status_timestamp = status_data.get("timestamp")
-                status_updated_at = datetime.fromtimestamp(status_timestamp, tz=timezone.utc) if status_timestamp else datetime.now(timezone.utc)
-                
-                # Handle failed status with error details
+                if status_timestamp:
+                    try:
+                        status_ts_int = int(status_timestamp)
+                        status_updated_at = datetime.fromtimestamp(status_ts_int, tz=timezone.utc)
+                    except (TypeError, ValueError):
+                        status_updated_at = datetime.now(timezone.utc)
+                else:
+                    status_updated_at = datetime.now(timezone.utc)   
+
                 errors = status_data.get("errors")
                 if status == "failed" and errors:
                     logger.error(f"Message {wamid} failed: {errors}")
                 
-                # Update status and status_updated_at
                 stmt = update(Message).where(Message.whatsapp_message_id == wamid).values(
                     status=status,
                     status_updated_at=status_updated_at
@@ -411,7 +413,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
             content = ""
             message_type = "text"
 
-            # Interactive replies
             if "interactive" in msg_data:
                 interactive = msg_data["interactive"]
                 if interactive["type"] == "button_reply":
@@ -437,7 +438,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                     content = msg_data.get("text", {}).get("body") or msg_data.get(msg_type, {}).get("caption") or f"Unsupported message type: {msg_type}"
                     message_type = msg_type or "text"
 
-            # Find organisation
             result = await db.execute(
                 select(Organization.id, Organization.business_type)
                 .where(Organization.whatsapp_phone_number == business_phone_number)
@@ -448,7 +448,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                 return {"status": "ignored", "reason": "unknown_whatsapp_number"}
             org_id, business_type = row
 
-            # Get or create conversation
             conv_stmt = select(Conversation).where(
                 Conversation.organization_id == org_id,
                 Conversation.customer_phone_number == from_number
@@ -477,7 +476,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                 if conv.reply_mode is None:
                     conv.reply_mode = 'ai'
 
-            # Language detection (Phase 17)
             if not conv.rule_state.get("lang"):
                 user_locale = msg_data.get("user_locale")
                 if user_locale:
@@ -486,7 +484,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                     await db.commit()
                     logger.info(f"Auto-detected language: {detected} for conv {conv.id}")
 
-            # Voice transcription (Phase 18)
             if msg_type == "audio" and media_whatsapp_id:
                 config = await get_whatsapp_config(str(org_id))
                 if config:
@@ -499,7 +496,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                             message_type = "text"
                             logger.info(f"Transcribed voice note: {content[:100]}...")
 
-            # Create message record
             new_message_id = uuid.uuid4()
             sort_ts = datetime.fromtimestamp(timestamp, tz=timezone.utc)
             insert_stmt = pg_insert(Message).values(
@@ -520,13 +516,13 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                 whatsapp_message_id=wamid,
                 whatsapp_timestamp=timestamp,
                 sort_timestamp=sort_ts,
-                status_updated_at=datetime.now(timezone.utc)  # Added for Phase 3
+                status_updated_at=datetime.now(timezone.utc)
             )
             upsert_stmt = insert_stmt.on_conflict_do_update(
                 index_elements=['whatsapp_message_id'],
                 set_={
                     'status': 'delivered',
-                    'status_updated_at': datetime.now(timezone.utc),  # Added for Phase 3
+                    'status_updated_at': datetime.now(timezone.utc),
                     'content': content,
                     'message_type': message_type,
                     'media_whatsapp_id': media_whatsapp_id,
@@ -536,7 +532,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
             )
             await db.execute(upsert_stmt)
 
-            # Update conversation stats
             naive_utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
             await db.execute(
                 update(Conversation)
@@ -562,15 +557,12 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                     media_content_type or "application/octet-stream"
                 )
 
-            # Sentiment escalation (Phase 12)
-            # Sentiment analysis (store only, no escalation)
             if conv.reply_mode == 'bot':
                 sentiment = analyze_sentiment(content)
                 sentiment_score = 1.0 if sentiment['label'] == 'POSITIVE' else -1.0 if sentiment['label'] == 'NEGATIVE' else 0.0
                 lead.sentiment_score = sentiment_score
                 lead.intent_label = simple_intent(content)
                 await db.commit()
-                # No escalation – just log the score
                 if sentiment_score < -0.5:
                     logger.info(f"Negative sentiment detected (score={sentiment_score}) for conv {conv.id} – no action taken.")
             else:
@@ -580,59 +572,62 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
             # 1. Rule engine
             if conv.reply_mode == 'rule':
                 logger.info(f"Using rule engine for org {org_id}")
-                    # ----- TYPING START -----
-                await manager.send_typing_start(str(org_id), str(conv.id), "rule")
+                
+                # Store IDs before try to avoid expired object issue
+                conv_id_str = str(conv.id)
+                org_id_str = str(org_id)
+                await manager.send_typing_start(org_id_str, conv_id_str, "rule")
+                
                 try:
-                    reply, updated_state = await get_rule_reply(str(org_id), str(conv.id), content, from_number)
+                    reply, updated_state = await get_rule_reply(org_id_str, conv_id_str, content, from_number)
+                    if updated_state:
+                        conv.rule_state = updated_state
+                        await db.execute(update(Conversation).where(Conversation.id == conv.id).values(rule_state=updated_state))
+                        await db.commit()
+                    
+                    if reply == "__INTERACTIVE__":
+                        return {"status": "ok"}
+                    
+                    if reply:
+                        last_out_stmt = select(Message).where(
+                            Message.conversation_id == conv.id,
+                            Message.direction == "outbound"
+                        ).order_by(Message.sort_timestamp.desc()).limit(1)
+                        last_out = (await db.execute(last_out_stmt)).scalar_one_or_none()
+                        send_reply = True
+                        if last_out and last_out.content == reply:
+                            delta = datetime.now(timezone.utc) - last_out.created_at
+                            if delta.total_seconds() < 5:
+                                logger.info("Skipping duplicate outbound reply")
+                                send_reply = False
+                        if send_reply:
+                            success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=org_id_str)
+                            if success:
+                                out_msg = Message(
+                                    id=uuid.uuid4(),
+                                    conversation_id=conv.id,
+                                    direction="outbound",
+                                    mode="rule",
+                                    content=reply,
+                                    is_ai_generated=False,
+                                    status="sent",
+                                    created_at=datetime.now(timezone.utc),
+                                    whatsapp_message_id=wamid,
+                                    whatsapp_timestamp=int(datetime.now(timezone.utc).timestamp()),
+                                    sort_timestamp=datetime.now(timezone.utc),
+                                    status_updated_at=datetime.now(timezone.utc)
+                                )
+                                db.add(out_msg)
+                                await db.execute(update(Conversation).where(Conversation.id == conv.id).values(last_message_at=datetime.now(timezone.utc)))
+                                await db.commit()
+                                logger.info(f"Rule-based reply sent to {from_number}")
+                        return {"status": "ok"}
+                    else:
+                        conv.reply_mode = 'ai'
+                        await db.commit()
                 finally:
-                    await manager.send_typing_stop(str(org_id), str(conv.id))
-                reply, updated_state = await get_rule_reply(str(org_id), str(conv.id), content, from_number)
-                if updated_state:
-                    conv.rule_state = updated_state
-                    await db.execute(update(Conversation).where(Conversation.id == conv.id).values(rule_state=updated_state))
-                    await db.commit()
-                if reply == "__INTERACTIVE__":
-                    return {"status": "ok"}
-                if reply:
-                    # Send reply with duplicate prevention
-                    last_out_stmt = select(Message).where(
-                        Message.conversation_id == conv.id,
-                        Message.direction == "outbound"
-                    ).order_by(Message.sort_timestamp.desc()).limit(1)
-                    last_out = (await db.execute(last_out_stmt)).scalar_one_or_none()
-                    send_reply = True
-                    if last_out and last_out.content == reply:
-                        delta = datetime.now(timezone.utc) - last_out.created_at
-                        if delta.total_seconds() < 5:
-                            logger.info("Skipping duplicate outbound reply")
-                            send_reply = False
-                    if send_reply:
-                        success, wamid = await send_whatsapp_text(to_number=from_number, text=reply, org_id=str(org_id))
-                        if success:
-                            out_msg = Message(
-                                id=uuid.uuid4(),
-                                conversation_id=conv.id,
-                                direction="outbound",
-                                mode="rule",
-                                content=reply,
-                                is_ai_generated=False,
-                                status="sent",
-                                created_at=datetime.now(timezone.utc),
-                                whatsapp_message_id=wamid,
-                                whatsapp_timestamp=int(datetime.now(timezone.utc).timestamp()),
-                                sort_timestamp=datetime.now(timezone.utc),
-                                status_updated_at=datetime.now(timezone.utc)  # Added for Phase 3
-                            )
-                            db.add(out_msg)
-                            await db.execute(update(Conversation).where(Conversation.id == conv.id).values(last_message_at=datetime.now(timezone.utc)))
-                            await db.commit()
-                            logger.info(f"Rule-based reply sent to {from_number}")
-                    # Lead capture in rule mode (keep existing code from your file)
-                    return {"status": "ok"}
-                else:
-                    conv.reply_mode = 'ai'
-                    await db.commit()
-
+                    await manager.send_typing_stop(org_id_str, conv_id_str)
+        
             # 2. Generic Bot Engine
             elif conv.reply_mode == 'bot':
                 if not is_generic_enabled_for_org(str(org_id)):
@@ -647,7 +642,6 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                         await db.commit()
                     else:
                         logger.info(f"Using GenericBotEngine for org {org_id}, conv {conv.id}")
-                        # Smart defaults (Phase 14)
                         current_state = conv.rule_state or {}
                         if not current_state.get("responses"):
                             last_lead = await get_last_lead_data(from_number, str(org_id))
@@ -663,8 +657,33 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                                         await db.commit()
                         engine = GenericBotEngine(active_config)
                         action = None
-                        # ----- TYPING START -----
-                        await manager.send_typing_start(str(org_id), str(conv.id), "bot")
+                        
+                        # Helper to save bot messages – fixed to include all required fields
+                        async def save_bot_message(content: str, wamid: str, msg_type: str = "text"):
+                            now_utc = datetime.now(timezone.utc)
+                            out_msg = Message(
+                                id=uuid.uuid4(),
+                                conversation_id=conv.id,
+                                organization_id=conv.organization_id,
+                                direction="outbound",
+                                mode="bot",
+                                message_type=msg_type,
+                                content=content,
+                                is_ai_generated=True,
+                                status="sent",
+                                created_at=now_utc,
+                                whatsapp_message_id=wamid,
+                                whatsapp_timestamp=int(now_utc.timestamp()),
+                                sort_timestamp=now_utc,
+                                status_updated_at=now_utc
+                            )
+                            db.add(out_msg)
+                            await db.commit()
+                        
+                        # Store IDs before try to avoid expired object in finally
+                        conv_id_str = str(conv.id)
+                        org_id_str = str(org_id)
+                        await manager.send_typing_start(org_id_str, conv_id_str, "bot")
                         try:
                             action = engine.process(content, current_state)
                             if action:
@@ -676,27 +695,12 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                                 action_type = action["action"]
                                 data = action.get("data", {})
 
-                                # Language selection handler
                                 if action_type == "ask_language":
                                     question = data.get("message")
                                     options = data.get("options", [])
-                                    success, wamid = await send_whatsapp_interactive(from_number, question, options, str(org_id))
+                                    success, wamid = await send_whatsapp_interactive(from_number, question, options, org_id_str)
                                     if success:
-                                        out_msg = Message(
-                                            id=uuid.uuid4(),
-                                            conversation_id=conv.id,
-                                            direction="outbound",
-                                            mode="bot",
-                                            content=question,
-                                            is_ai_generated=True,
-                                            status="sent",
-                                            created_at=datetime.now(timezone.utc),
-                                            whatsapp_message_id=wamid,
-                                            sort_timestamp=datetime.now(timezone.utc),
-                                            status_updated_at=datetime.now(timezone.utc)
-                                        )
-                                        db.add(out_msg)
-                                        await db.commit()
+                                        await save_bot_message(question, wamid, msg_type="interactive")
                                     return {"status": "ok"}
 
                                 if action_type == "ask":
@@ -705,68 +709,89 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                                     options = data.get("options", [])
                                     media = data.get("media")
                                     if media:
-                                        await send_whatsapp_media(from_number, media, str(org_id))
+                                        await send_whatsapp_media(from_number, media, org_id_str)
                                     if field_type in ["button", "list"] and options:
-                                        await send_whatsapp_interactive(from_number, question, options, str(org_id))
+                                        success, wamid = await send_whatsapp_interactive(from_number, question, options, org_id_str)
+                                        if success:
+                                            await save_bot_message(question, wamid, msg_type="interactive")
                                     else:
-                                        await send_whatsapp_text(from_number, question, str(org_id))
+                                        success, wamid = await send_whatsapp_text(from_number, question, org_id_str)
+                                        if success:
+                                            await save_bot_message(question, wamid)
                                     return {"status": "ok"}
 
                                 elif action_type in ["validation_error", "invalid_field", "confirmation_invalid"]:
                                     error_msg = data.get("error") or data.get("message") or "Invalid input"
-                                    await send_whatsapp_text(from_number, error_msg, str(org_id))
+                                    success, wamid = await send_whatsapp_text(from_number, error_msg, org_id_str)
+                                    if success:
+                                        await save_bot_message(error_msg, wamid)
                                     return {"status": "ok"}
 
                                 elif action_type == "ask_confirmation":
                                     question = data.get("message")
                                     options = data.get("options", [])
-                                    await send_whatsapp_interactive(from_number, question, options, str(org_id))
+                                    success, wamid = await send_whatsapp_interactive(from_number, question, options, org_id_str)
+                                    if success:
+                                        await save_bot_message(question, wamid, msg_type="interactive")
                                     return {"status": "ok"}
 
                                 elif action_type == "ask_which_field":
                                     question = data.get("question", "Which field would you like to change?")
                                     options = data.get("options", [])
-                                    await send_whatsapp_interactive(from_number, question, options, str(org_id))
+                                    success, wamid = await send_whatsapp_interactive(from_number, question, options, org_id_str)
+                                    if success:
+                                        await save_bot_message(question, wamid, msg_type="interactive")
                                     return {"status": "ok"}
 
                                 elif action_type == "ask_new_value":
-                                    await send_whatsapp_text(from_number, f"Please provide the new value for {data['field']}:", str(org_id))
+                                    msg = f"Please provide the new value for {data['field']}:"
+                                    success, wamid = await send_whatsapp_text(from_number, msg, org_id_str)
+                                    if success:
+                                        await save_bot_message(msg, wamid)
                                     return {"status": "ok"}
 
                                 elif action_type == "ask_new_value_with_options":
                                     question = data.get("question")
                                     options = data.get("options", [])
-                                    await send_whatsapp_interactive(from_number, question, options, str(org_id))
+                                    success, wamid = await send_whatsapp_interactive(from_number, question, options, org_id_str)
+                                    if success:
+                                        await save_bot_message(question, wamid, msg_type="interactive")
                                     return {"status": "ok"}
 
                                 elif action_type == "ask_custom_field":
-                                    message = data.get("message", "Please type the field name you want to change:")
-                                    await send_whatsapp_text(from_number, message, str(org_id))
+                                    msg = data.get("message", "Please type the field name you want to change:")
+                                    success, wamid = await send_whatsapp_text(from_number, msg, org_id_str)
+                                    if success:
+                                        await save_bot_message(msg, wamid)
                                     return {"status": "ok"}
 
                                 elif action_type == "ask_custom_value":
-                                    message = data.get("message", "Please type the new value:")
-                                    await send_whatsapp_text(from_number, message, str(org_id))
+                                    msg = data.get("message", "Please type the new value:")
+                                    success, wamid = await send_whatsapp_text(from_number, msg, org_id_str)
+                                    if success:
+                                        await save_bot_message(msg, wamid)
                                     return {"status": "ok"}
 
                                 elif action_type == "ask_continue_or_new":
                                     question = data.get("message")
                                     options = data.get("options", [])
-                                    await send_whatsapp_interactive(from_number, question, options, str(org_id))
+                                    success, wamid = await send_whatsapp_interactive(from_number, question, options, org_id_str)
+                                    if success:
+                                        await save_bot_message(question, wamid, msg_type="interactive")
                                     return {"status": "ok"}
 
                                 elif action_type == "send_text":
-                                    await send_whatsapp_text(from_number, data["message"], str(org_id))
+                                    msg = data["message"]
+                                    success, wamid = await send_whatsapp_text(from_number, msg, org_id_str)
+                                    if success:
+                                        await save_bot_message(msg, wamid)
                                     return {"status": "ok"}
 
                                 elif action_type == "unmatched":
-                                    # Notify user that we are switching to AI mode
-                                    await send_whatsapp_text(
-                                        from_number,
-                                        "I'll switch to AI mode to better answer your question.",
-                                        str(org_id)
-                                    )
-                                    # Change conversation mode to AI
+                                    msg = "I'll switch to AI mode to better answer your question."
+                                    success, wamid = await send_whatsapp_text(from_number, msg, org_id_str)
+                                    if success:
+                                        await save_bot_message(msg, wamid)
                                     conv.reply_mode = 'ai'
                                     await db.execute(
                                         update(Conversation)
@@ -774,12 +799,14 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                                         .values(reply_mode='ai')
                                     )
                                     await db.commit()
-                                    # Continue to AI processing (action = None)
-                                    # The webhook will fall through to AI mode block
+                                    # Continue to AI processing
 
                                 elif action_type == "create_lead":
-                                    await create_lead_from_generic_bot(str(org_id), str(conv.id), from_number, data)
-                                    await send_whatsapp_text(from_number, "Thank you! Your information has been saved.", str(org_id))
+                                    await create_lead_from_generic_bot(org_id_str, conv_id_str, from_number, data)
+                                    msg = "Thank you! Your information has been saved."
+                                    success, wamid = await send_whatsapp_text(from_number, msg, org_id_str)
+                                    if success:
+                                        await save_bot_message(msg, wamid)
                                     conv.rule_state["completed"] = True
                                     await db.execute(update(Conversation).where(Conversation.id == conv.id).values(rule_state=conv.rule_state))
                                     await db.commit()
@@ -789,16 +816,24 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                                     from modules.bot_builder.booking_helper import get_available_slots
                                     slots = await get_available_slots(org_id, data.get("booking_config"))
                                     if not slots:
-                                        await send_whatsapp_text(from_number, "No slots available. Please try later.", str(org_id))
+                                        msg = "No slots available. Please try later."
+                                        success, wamid = await send_whatsapp_text(from_number, msg, org_id_str)
+                                        if success:
+                                            await save_bot_message(msg, wamid)
                                         return {"status": "ok"}
                                     options = [{"id": slot["id"], "title": slot["display"]} for slot in slots]
-                                    success, wamid = await send_whatsapp_interactive(from_number, data["question"], options, str(org_id))
+                                    success, wamid = await send_whatsapp_interactive(from_number, data["question"], options, org_id_str)
+                                    if success:
+                                        await save_bot_message(data["question"], wamid, msg_type="interactive")
                                     return {"status": "ok"}
 
                                 elif action_type == "create_booking":
                                     from modules.bot_builder.booking_helper import create_booking
                                     booking_id = await create_booking(org_id, conv.id, from_number, data)
-                                    await send_whatsapp_text(from_number, f"Your booking has been confirmed! ID: {booking_id}", str(org_id))
+                                    msg = f"Your booking has been confirmed! ID: {booking_id}"
+                                    success, wamid = await send_whatsapp_text(from_number, msg, org_id_str)
+                                    if success:
+                                        await save_bot_message(msg, wamid)
                                     conv.rule_state["completed"] = True
                                     await db.commit()
                                     return {"status": "ok"}
@@ -808,8 +843,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                             conv.reply_mode = 'ai'
                             await db.commit()
                         finally:
-                            # ----- TYPING STOP -----
-                            await manager.send_typing_stop(str(org_id), str(conv.id))
+                            await manager.send_typing_stop(org_id_str, conv_id_str)
 
             # 3. Human mode
             if conv.reply_mode == 'human':
