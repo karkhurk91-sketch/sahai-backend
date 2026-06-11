@@ -144,6 +144,7 @@ class ConversationService:
                 "created_at": msg.created_at.isoformat(),
                 "sort_timestamp": msg.sort_timestamp.isoformat() if msg.sort_timestamp else msg.created_at.isoformat(),
                 "status": msg.status,
+                "mode": getattr(msg, 'mode', None),
                 "message_type": msg.message_type,
                 "media_url": msg.media_url,
                 "media_file_name": msg.media_file_name,
@@ -167,13 +168,15 @@ class ConversationService:
             conversation_id=conv_id,
             content=text,
             direction="outbound",
+            mode="human",
             message_type="text",
             is_ai_generated=False,
             human_agent_id=user_id,
             status="sending",  # START as sending (before API call)
             created_at=datetime.now(timezone.utc),
             sort_timestamp=sort_ts,  # Use current time as sort key
-            whatsapp_timestamp=int(sort_ts.timestamp())
+            whatsapp_timestamp=int(sort_ts.timestamp()),
+            status_updated_at=datetime.now(timezone.utc) 
         )
         message = await self.msg_repo.create(message)
         conv.last_message_at = datetime.utcnow()
@@ -207,6 +210,7 @@ class ConversationService:
                     message.whatsapp_message_id = wamid
                 else:
                     message.status = "failed"
+                message.status_updated_at = datetime.now(timezone.utc)   # <-- ADD
                 await self.session.commit()
                 # Broadcast message update via WebSocket
                 from modules.websocket import manager
@@ -219,7 +223,7 @@ class ConversationService:
                 })
         except Exception as e:
             logger.error(f"Error sending WhatsApp text: {e}")
-
+            
     # ---------- Upload media ----------
     async def upload_media(
         self,

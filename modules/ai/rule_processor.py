@@ -8,6 +8,8 @@ from modules.ai.flow_service import get_org_conversation_flow
 from modules.ai.lead_capture import create_lead
 from modules.common.logger import get_logger
 from modules.interactive.config_loader import get_default_conversation_flow
+from modules.websocket import manager
+
 
 logger = get_logger(__name__)
 

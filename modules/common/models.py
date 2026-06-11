@@ -137,7 +137,7 @@ class Conversation(Base):
     booking_status = Column(String(50), nullable=True)  # pending, confirmed, cancelled, completed
     recommendation_shown = Column(Boolean, default=False)  # Track if recommendation was already shown
     last_intent = Column(String(100), nullable=True)  # Last detected intent (not LLM-driven)
-
+    
 class Message(Base):
     __tablename__ = "messages"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -158,14 +158,20 @@ class Message(Base):
     whatsapp_message_id = Column(String(255), unique=True, nullable=True)
     local_media_path = Column(String(500), nullable=True)
     organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True)
-    # New fields for proper message ordering (source of truth: Meta's timestamp)
-    whatsapp_timestamp = Column(Integer, nullable=True)  # Unix seconds from Meta's webhook
-    sort_timestamp = Column(DateTime(timezone=True), nullable=False)    
+    whatsapp_timestamp = Column(Integer, nullable=True)
+    sort_timestamp = Column(DateTime(timezone=True), nullable=False)
+    
+    # NEW COLUMNS FOR PHASE 1
+    mode = Column(String(20), nullable=False, server_default='ai', default='ai')
+    """Message origin mode: 'user', 'ai', 'human', 'rule', 'bot'"""
+    
+    status_updated_at = Column(DateTime(timezone=True), nullable=True)
+    """Timestamp when the status was last updated"""
+    
     __table_args__ = (
         Index("ix_messages_sort_timestamp", "sort_timestamp"),
         Index("ix_messages_conversation_sort", "conversation_id", "sort_timestamp"),
     )
-
 
 class LeadSchema(Base):
     __tablename__ = "lead_schemas"

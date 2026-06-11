@@ -311,6 +311,7 @@ async def upload_media(
         direction="outbound",
         message_type=media_category,
         content=caption or "",
+        mode="human",
         status="sending",
         created_at=now_utc,
         sort_timestamp=now_utc,
@@ -321,6 +322,7 @@ async def upload_media(
         media_file_name=file.filename,
         media_content_type=mime_type,
         media_file_size=file.size,
+        status_updated_at=now_utc  # <-- Phase 3: initial timestamp
     )
     db.add(temp_message)
     await db.flush()
@@ -341,6 +343,7 @@ async def upload_media(
     except Exception as e:
         logger.error(f"WhatsApp upload failed: {e}")
         temp_message.status = "failed"
+        temp_message.status_updated_at = datetime.now(timezone.utc)  # <-- Phase 3
         await db.commit()
         raise HTTPException(502, f"WhatsApp upload error: {str(e)}")
 
@@ -356,12 +359,14 @@ async def upload_media(
         )
         if not success:
             temp_message.status = "failed"
+            temp_message.status_updated_at = datetime.now(timezone.utc)  # <-- Phase 3
             await db.commit()
             raise HTTPException(502, "Failed to send media message")
         logger.info(f"Media message sent, wamid: {wamid}")
     except Exception as e:
         logger.error(f"Failed to send media message: {e}")
         temp_message.status = "failed"
+        temp_message.status_updated_at = datetime.now(timezone.utc)  # <-- Phase 3
         await db.commit()
         raise HTTPException(502, f"Failed to send media: {str(e)}")
 
@@ -371,6 +376,7 @@ async def upload_media(
     temp_message.status = "sent"
     temp_message.whatsapp_message_id = wamid
     temp_message.media_whatsapp_id = media_id
+    temp_message.status_updated_at = datetime.now(timezone.utc)  # <-- Phase 3
 
     # Try immediate download (optional)
     local_path = None
@@ -400,7 +406,6 @@ async def upload_media(
         "status": "sent",
         "media_url": local_url
     }
-
 # ---------- Media Fetch Endpoint ----------
 @router.get("/{conv_id}/media/{message_id}", response_model=None)
 async def fetch_message_media(

@@ -176,6 +176,27 @@ class WhatsAppService:
         self.api_version = "v21.0"
         self.base_url = "https://graph.facebook.com"
 
+    async def send_location_message(self, to_number: str, latitude: float, longitude: float, address: str = None) -> Tuple[bool, Optional[str]]:
+        """Send a location message using WhatsApp Cloud API."""
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to_number,
+            "type": "location",
+            "location": {
+                "latitude": latitude,
+                "longitude": longitude,
+                "name": address or "Location",
+                "address": address or ""
+            }
+        }
+        try:
+            result = await self._request("POST", f"{self.phone_number_id}/messages", json=payload)
+            wamid = result.get("messages", [{}])[0].get("id")
+            return True, wamid
+        except Exception as e:
+            logger.error(f"Failed to send location message: {e}")
+            return False, None
+
     async def _request(self, method: str, endpoint: str, **kwargs) -> dict:
         """Make an authenticated request to WhatsApp API."""
         url = f"{self.base_url}/{self.api_version}/{endpoint}"

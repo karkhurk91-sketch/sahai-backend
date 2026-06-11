@@ -35,6 +35,8 @@ from modules.ml.feature_extractor import extract_features_for_lead
 from modules.ml.duplicates import get_embedding
 from modules.websocket import send_alert
 from modules.tasks.message_tasks import process_message_task
+from modules.websocket import manager
+
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/webhook", tags=["WhatsApp"])
@@ -374,10 +376,24 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                 status = status_data.get("status")
                 if not wamid:
                     continue
-                stmt = update(Message).where(Message.whatsapp_message_id == wamid).values(status=status)
+                
+                # Get optional timestamp from webhook
+                status_timestamp = status_data.get("timestamp")
+                status_updated_at = datetime.fromtimestamp(status_timestamp, tz=timezone.utc) if status_timestamp else datetime.now(timezone.utc)
+                
+                # Handle failed status with error details
+                errors = status_data.get("errors")
+                if status == "failed" and errors:
+                    logger.error(f"Message {wamid} failed: {errors}")
+                
+                # Update status and status_updated_at
+                stmt = update(Message).where(Message.whatsapp_message_id == wamid).values(
+                    status=status,
+                    status_updated_at=status_updated_at
+                )
                 await db.execute(stmt)
                 await db.commit()
-                logger.info(f"Updated message {wamid} status to {status}")
+                logger.info(f"Updated message {wamid} status to {status} at {status_updated_at}")
 
         # Incoming messages
         if "messages" in value:
@@ -491,6 +507,7 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                 conversation_id=conv.id,
                 organization_id=org_id,
                 direction="inbound",
+                mode="user",
                 content=content,
                 message_type=message_type,
                 media_whatsapp_id=media_whatsapp_id,
@@ -502,12 +519,14 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                 created_at=datetime.now(timezone.utc),
                 whatsapp_message_id=wamid,
                 whatsapp_timestamp=timestamp,
-                sort_timestamp=sort_ts
+                sort_timestamp=sort_ts,
+                status_updated_at=datetime.now(timezone.utc)  # Added for Phase 3
             )
             upsert_stmt = insert_stmt.on_conflict_do_update(
                 index_elements=['whatsapp_message_id'],
                 set_={
                     'status': 'delivered',
+                    'status_updated_at': datetime.now(timezone.utc),  # Added for Phase 3
                     'content': content,
                     'message_type': message_type,
                     'media_whatsapp_id': media_whatsapp_id,
@@ -561,6 +580,12 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
             # 1. Rule engine
             if conv.reply_mode == 'rule':
                 logger.info(f"Using rule engine for org {org_id}")
+                    # ----- TYPING START -----
+                await manager.send_typing_start(str(org_id), str(conv.id), "rule")
+                try:
+                    reply, updated_state = await get_rule_reply(str(org_id), str(conv.id), content, from_number)
+                finally:
+                    await manager.send_typing_stop(str(org_id), str(conv.id))
                 reply, updated_state = await get_rule_reply(str(org_id), str(conv.id), content, from_number)
                 if updated_state:
                     conv.rule_state = updated_state
@@ -588,13 +613,15 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                                 id=uuid.uuid4(),
                                 conversation_id=conv.id,
                                 direction="outbound",
+                                mode="rule",
                                 content=reply,
                                 is_ai_generated=False,
                                 status="sent",
                                 created_at=datetime.now(timezone.utc),
                                 whatsapp_message_id=wamid,
                                 whatsapp_timestamp=int(datetime.now(timezone.utc).timestamp()),
-                                sort_timestamp=datetime.now(timezone.utc)
+                                sort_timestamp=datetime.now(timezone.utc),
+                                status_updated_at=datetime.now(timezone.utc)  # Added for Phase 3
                             )
                             db.add(out_msg)
                             await db.execute(update(Conversation).where(Conversation.id == conv.id).values(last_message_at=datetime.now(timezone.utc)))
@@ -606,174 +633,183 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks, d
                     conv.reply_mode = 'ai'
                     await db.commit()
 
-            # 2. Generic Bot Engine
-            elif conv.reply_mode == 'bot':
-                if not is_generic_enabled_for_org(str(org_id)):
-                    logger.warning("Bot mode not allowed, falling back to AI")
-                    conv.reply_mode = 'ai'
-                    await db.commit()
-                else:
-                    active_config = await get_active_bot_config(str(org_id))
-                    if not active_config:
-                        logger.warning("No active config, falling back to AI")
+                # 2. Generic Bot Engine
+                elif conv.reply_mode == 'bot':
+                    if not is_generic_enabled_for_org(str(org_id)):
+                        logger.warning("Bot mode not allowed, falling back to AI")
                         conv.reply_mode = 'ai'
                         await db.commit()
                     else:
-                        logger.info(f"Using GenericBotEngine for org {org_id}, conv {conv.id}")
-                        # Smart defaults (Phase 14)
-                        current_state = conv.rule_state or {}
-                        if not current_state.get("responses"):
-                            last_lead = await get_last_lead_data(from_number, str(org_id))
-                            if last_lead:
-                                bot_fields = {f["name"] for f in active_config.get("fields", [])}
-                                prefill = {k: v for k, v in last_lead.items() if k in bot_fields}
-                                if prefill:
-                                    current_state["responses"] = prefill
-                                    logger.info(f"Pre-filled fields: {list(prefill.keys())}")
-                                    if prefill.get("name"):
-                                        conv.customer_name = prefill["name"]
-                                        await db.execute(update(Conversation).where(Conversation.id == conv.id).values(customer_name=prefill["name"]))
-                                        await db.commit()
-                        engine = GenericBotEngine(active_config)
-                        action = None
-                        try:
-                            action = engine.process(content, current_state)
-                            if action:
-                                new_state = action.get("new_state", current_state)
-                                conv.rule_state = new_state
-                                await db.execute(update(Conversation).where(Conversation.id == conv.id).values(rule_state=new_state))
-                                await db.commit()
-
-                                action_type = action["action"]
-                                data = action.get("data", {})
-
-                                # Language selection handler
-                                if action_type == "ask_language":
-                                    question = data.get("message")
-                                    options = data.get("options", [])
-                                    success, wamid = await send_whatsapp_interactive(from_number, question, options, str(org_id))
-                                    if success:
-                                        out_msg = Message(id=uuid.uuid4(), conversation_id=conv.id, direction="outbound", content=question, is_ai_generated=True, status="sent", created_at=datetime.now(timezone.utc), whatsapp_message_id=wamid, sort_timestamp=datetime.now(timezone.utc))
-                                        db.add(out_msg)
-                                        await db.commit()
-                                    return {"status": "ok"}
-
-                                if action_type == "ask":
-                                    question = data["question"]
-                                    field_type = data.get("field_type", "text")
-                                    options = data.get("options", [])
-                                    media = data.get("media")
-                                    if media:
-                                        await send_whatsapp_media(from_number, media, str(org_id))
-                                    if field_type in ["button", "list"] and options:
-                                        await send_whatsapp_interactive(from_number, question, options, str(org_id))
-                                    else:
-                                        await send_whatsapp_text(from_number, question, str(org_id))
-                                    return {"status": "ok"}
-
-                                elif action_type in ["validation_error", "invalid_field", "confirmation_invalid"]:
-                                    error_msg = data.get("error") or data.get("message") or "Invalid input"
-                                    await send_whatsapp_text(from_number, error_msg, str(org_id))
-                                    return {"status": "ok"}
-
-                                elif action_type == "ask_confirmation":
-                                    question = data.get("message")
-                                    options = data.get("options", [])
-                                    await send_whatsapp_interactive(from_number, question, options, str(org_id))
-                                    return {"status": "ok"}
-
-                                elif action_type == "ask_which_field":
-                                    question = data.get("question", "Which field would you like to change?")
-                                    options = data.get("options", [])
-                                    await send_whatsapp_interactive(from_number, question, options, str(org_id))
-                                    return {"status": "ok"}
-
-                                elif action_type == "ask_new_value":
-                                    await send_whatsapp_text(from_number, f"Please provide the new value for {data['field']}:", str(org_id))
-                                    return {"status": "ok"}
-
-                                elif action_type == "ask_new_value_with_options":
-                                    question = data.get("question")
-                                    options = data.get("options", [])
-                                    await send_whatsapp_interactive(from_number, question, options, str(org_id))
-                                    return {"status": "ok"}
-
-                                elif action_type == "ask_custom_field":
-                                    message = data.get("message", "Please type the field name you want to change:")
-                                    await send_whatsapp_text(from_number, message, str(org_id))
-                                    return {"status": "ok"}
-
-                                elif action_type == "ask_custom_value":
-                                    message = data.get("message", "Please type the new value:")
-                                    await send_whatsapp_text(from_number, message, str(org_id))
-                                    return {"status": "ok"}
-
-                                elif action_type == "ask_continue_or_new":
-                                    question = data.get("message")
-                                    options = data.get("options", [])
-                                    await send_whatsapp_interactive(from_number, question, options, str(org_id))
-                                    return {"status": "ok"}
-
-                                elif action_type == "send_text":
-                                    await send_whatsapp_text(from_number, data["message"], str(org_id))
-                                    return {"status": "ok"}
-
-                                elif action_type == "unmatched":
-                                    # Notify user that we are switching to AI mode
-                                    await send_whatsapp_text(
-                                        from_number,
-                                        "I'll switch to AI mode to better answer your question.",
-                                        str(org_id)
-                                    )
-                                    # Change conversation mode to AI
-                                    conv.reply_mode = 'ai'
-                                    await db.execute(
-                                        update(Conversation)
-                                        .where(Conversation.id == conv.id)
-                                        .values(reply_mode='ai')
-                                    )
-                                    await db.commit()
-                                    
-                                    # Now process the same user input through the AI mode
-                                    # We set action = None so that the AI block below runs
-                                    action = None
-                                    # Continue to AI processing (do NOT return)
-                                    # The webhook will fall through to the AI mode block
-                                elif action_type == "create_lead":
-                                    await create_lead_from_generic_bot(str(org_id), str(conv.id), from_number, data)
-                                    await send_whatsapp_text(from_number, "Thank you! Your information has been saved.", str(org_id))
-                                    conv.rule_state["completed"] = True
-                                    await db.execute(update(Conversation).where(Conversation.id == conv.id).values(rule_state=conv.rule_state))
-                                    await db.commit()
-                                    return {"status": "ok"}
-
-                                elif action_type == "ask_booking":
-                                    # Fetch available slots from your booking system
-                                    from modules.bot_builder.booking_helper import get_available_slots
-                                    slots = await get_available_slots(org_id, data.get("booking_config"))
-                                    if not slots:
-                                        await send_whatsapp_text(from_number, "No slots available. Please try later.", str(org_id))
-                                        return {"status": "ok"}
-                                    # Send slots as interactive list (or buttons)
-                                    options = [{"id": slot["id"], "title": slot["display"]} for slot in slots]
-                                    success, wamid = await send_whatsapp_interactive(from_number, data["question"], options, str(org_id))
-                                    # Save outbound message...
-                                    return {"status": "ok"}
-
-                                elif action_type == "create_booking":
-                                    # Call your existing booking creation API
-                                    from modules.bot_builder.booking_helper import create_booking
-                                    booking_id = await create_booking(org_id, conv.id, from_number, data)
-                                    await send_whatsapp_text(from_number, f"Your booking has been confirmed! ID: {booking_id}", str(org_id))
-                                    # Also mark conversation as completed (optional)
-                                    conv.rule_state["completed"] = True
-                                    await db.commit()
-                                    return {"status": "ok"}
-
-                        except Exception as e:
-                            logger.exception(f"Generic bot engine error: {e}")
+                        active_config = await get_active_bot_config(str(org_id))
+                        if not active_config:
+                            logger.warning("No active config, falling back to AI")
                             conv.reply_mode = 'ai'
                             await db.commit()
+                        else:
+                            logger.info(f"Using GenericBotEngine for org {org_id}, conv {conv.id}")
+                            # Smart defaults (Phase 14)
+                            current_state = conv.rule_state or {}
+                            if not current_state.get("responses"):
+                                last_lead = await get_last_lead_data(from_number, str(org_id))
+                                if last_lead:
+                                    bot_fields = {f["name"] for f in active_config.get("fields", [])}
+                                    prefill = {k: v for k, v in last_lead.items() if k in bot_fields}
+                                    if prefill:
+                                        current_state["responses"] = prefill
+                                        logger.info(f"Pre-filled fields: {list(prefill.keys())}")
+                                        if prefill.get("name"):
+                                            conv.customer_name = prefill["name"]
+                                            await db.execute(update(Conversation).where(Conversation.id == conv.id).values(customer_name=prefill["name"]))
+                                            await db.commit()
+                            engine = GenericBotEngine(active_config)
+                            action = None
+                            # ----- TYPING START -----
+                            await manager.send_typing_start(str(org_id), str(conv.id), "bot")
+                            try:
+                                action = engine.process(content, current_state)
+                                if action:
+                                    new_state = action.get("new_state", current_state)
+                                    conv.rule_state = new_state
+                                    await db.execute(update(Conversation).where(Conversation.id == conv.id).values(rule_state=new_state))
+                                    await db.commit()
+
+                                    action_type = action["action"]
+                                    data = action.get("data", {})
+
+                                    # Language selection handler
+                                    if action_type == "ask_language":
+                                        question = data.get("message")
+                                        options = data.get("options", [])
+                                        success, wamid = await send_whatsapp_interactive(from_number, question, options, str(org_id))
+                                        if success:
+                                            out_msg = Message(
+                                                id=uuid.uuid4(),
+                                                conversation_id=conv.id,
+                                                direction="outbound",
+                                                mode="bot",
+                                                content=question,
+                                                is_ai_generated=True,
+                                                status="sent",
+                                                created_at=datetime.now(timezone.utc),
+                                                whatsapp_message_id=wamid,
+                                                sort_timestamp=datetime.now(timezone.utc),
+                                                status_updated_at=datetime.now(timezone.utc)
+                                            )
+                                            db.add(out_msg)
+                                            await db.commit()
+                                        return {"status": "ok"}
+
+                                    if action_type == "ask":
+                                        question = data["question"]
+                                        field_type = data.get("field_type", "text")
+                                        options = data.get("options", [])
+                                        media = data.get("media")
+                                        if media:
+                                            await send_whatsapp_media(from_number, media, str(org_id))
+                                        if field_type in ["button", "list"] and options:
+                                            await send_whatsapp_interactive(from_number, question, options, str(org_id))
+                                        else:
+                                            await send_whatsapp_text(from_number, question, str(org_id))
+                                        return {"status": "ok"}
+
+                                    elif action_type in ["validation_error", "invalid_field", "confirmation_invalid"]:
+                                        error_msg = data.get("error") or data.get("message") or "Invalid input"
+                                        await send_whatsapp_text(from_number, error_msg, str(org_id))
+                                        return {"status": "ok"}
+
+                                    elif action_type == "ask_confirmation":
+                                        question = data.get("message")
+                                        options = data.get("options", [])
+                                        await send_whatsapp_interactive(from_number, question, options, str(org_id))
+                                        return {"status": "ok"}
+
+                                    elif action_type == "ask_which_field":
+                                        question = data.get("question", "Which field would you like to change?")
+                                        options = data.get("options", [])
+                                        await send_whatsapp_interactive(from_number, question, options, str(org_id))
+                                        return {"status": "ok"}
+
+                                    elif action_type == "ask_new_value":
+                                        await send_whatsapp_text(from_number, f"Please provide the new value for {data['field']}:", str(org_id))
+                                        return {"status": "ok"}
+
+                                    elif action_type == "ask_new_value_with_options":
+                                        question = data.get("question")
+                                        options = data.get("options", [])
+                                        await send_whatsapp_interactive(from_number, question, options, str(org_id))
+                                        return {"status": "ok"}
+
+                                    elif action_type == "ask_custom_field":
+                                        message = data.get("message", "Please type the field name you want to change:")
+                                        await send_whatsapp_text(from_number, message, str(org_id))
+                                        return {"status": "ok"}
+
+                                    elif action_type == "ask_custom_value":
+                                        message = data.get("message", "Please type the new value:")
+                                        await send_whatsapp_text(from_number, message, str(org_id))
+                                        return {"status": "ok"}
+
+                                    elif action_type == "ask_continue_or_new":
+                                        question = data.get("message")
+                                        options = data.get("options", [])
+                                        await send_whatsapp_interactive(from_number, question, options, str(org_id))
+                                        return {"status": "ok"}
+
+                                    elif action_type == "send_text":
+                                        await send_whatsapp_text(from_number, data["message"], str(org_id))
+                                        return {"status": "ok"}
+
+                                    elif action_type == "unmatched":
+                                        # Notify user that we are switching to AI mode
+                                        await send_whatsapp_text(
+                                            from_number,
+                                            "I'll switch to AI mode to better answer your question.",
+                                            str(org_id)
+                                        )
+                                        # Change conversation mode to AI
+                                        conv.reply_mode = 'ai'
+                                        await db.execute(
+                                            update(Conversation)
+                                            .where(Conversation.id == conv.id)
+                                            .values(reply_mode='ai')
+                                        )
+                                        await db.commit()
+                                        # Continue to AI processing (action = None)
+                                        # The webhook will fall through to AI mode block
+
+                                    elif action_type == "create_lead":
+                                        await create_lead_from_generic_bot(str(org_id), str(conv.id), from_number, data)
+                                        await send_whatsapp_text(from_number, "Thank you! Your information has been saved.", str(org_id))
+                                        conv.rule_state["completed"] = True
+                                        await db.execute(update(Conversation).where(Conversation.id == conv.id).values(rule_state=conv.rule_state))
+                                        await db.commit()
+                                        return {"status": "ok"}
+
+                                    elif action_type == "ask_booking":
+                                        from modules.bot_builder.booking_helper import get_available_slots
+                                        slots = await get_available_slots(org_id, data.get("booking_config"))
+                                        if not slots:
+                                            await send_whatsapp_text(from_number, "No slots available. Please try later.", str(org_id))
+                                            return {"status": "ok"}
+                                        options = [{"id": slot["id"], "title": slot["display"]} for slot in slots]
+                                        success, wamid = await send_whatsapp_interactive(from_number, data["question"], options, str(org_id))
+                                        return {"status": "ok"}
+
+                                    elif action_type == "create_booking":
+                                        from modules.bot_builder.booking_helper import create_booking
+                                        booking_id = await create_booking(org_id, conv.id, from_number, data)
+                                        await send_whatsapp_text(from_number, f"Your booking has been confirmed! ID: {booking_id}", str(org_id))
+                                        conv.rule_state["completed"] = True
+                                        await db.commit()
+                                        return {"status": "ok"}
+
+                            except Exception as e:
+                                logger.exception(f"Generic bot engine error: {e}")
+                                conv.reply_mode = 'ai'
+                                await db.commit()
+                            finally:
+                                # ----- TYPING STOP -----
+                                await manager.send_typing_stop(str(org_id), str(conv.id))
 
             # 3. Human mode
             if conv.reply_mode == 'human':

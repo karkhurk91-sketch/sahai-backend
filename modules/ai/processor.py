@@ -13,6 +13,8 @@ from modules.common.models import Conversation, Message, LeadSchema, Lead
 from modules.common.logger import get_logger
 from modules.leads.assignment_engine import auto_assign_lead, determine_lead_intelligence
 from modules.message.sender import send_whatsapp_text, send_whatsapp_template
+from modules.websocket import manager
+
 
 logger = get_logger(__name__)
 memory_manager = MemoryManager()
@@ -172,51 +174,56 @@ async def _process_and_reply(
             is_lead = lead_data
 
     # ----- Send AI reply -----
-    if recent:
-        success, wamid = await send_whatsapp_text(to_number=customer_phone, text=ai_response, org_id=str(org_id))
-    else:
-        success, wamid = await send_whatsapp_template(
-            to_number=customer_phone,
-            template_name="hello",
-            language_code="en",
-            category="UTILITY",
-            org_id=str(org_id)
-        )
-
-    if not success:
-        logger.error(f"Failed to send reply to {customer_phone}")
-        return
-
-    logger.info(f"Reply sent to {customer_phone}")
-
-    # ----- Store AI message in DB (with required timestamps) -----
-    async with AsyncSessionLocal() as db:
-        try:
-            now_utc = datetime.now(timezone.utc)  # timezone-aware
-            ai_msg = Message(
-                id=uuid.uuid4(),
-                conversation_id=conv_uuid,
-                direction="outbound",
-                message_type="text",
-                content=ai_response,
-                is_ai_generated=True,
-                status="sent",
-                created_at=now_utc,
-                whatsapp_message_id=wamid,
-                whatsapp_timestamp=int(now_utc.timestamp()),
-                sort_timestamp=now_utc
+    await manager.send_typing_start(str(org_id), str(conv_uuid), "ai")
+    try:
+        if recent:
+            success, wamid = await send_whatsapp_text(to_number=customer_phone, text=ai_response, org_id=str(org_id))
+        else:
+            success, wamid = await send_whatsapp_template(
+                to_number=customer_phone,
+                template_name="hello",
+                language_code="en",
+                category="UTILITY",
+                org_id=str(org_id)
             )
-            db.add(ai_msg)
-            await db.execute(
-                text("UPDATE conversations SET last_message_at = NOW() WHERE id = :conv_id"),
-                {"conv_id": conversation_id}
-            )
-            await db.commit()
-            logger.info("Stored AI reply")
-        except Exception as e:
-            logger.error(f"Failed to store message: {e}")
-            await db.rollback()
 
+        if not success:
+            logger.error(f"Failed to send reply to {customer_phone}")
+            return
+
+        logger.info(f"Reply sent to {customer_phone}")
+
+        # ----- Store AI message in DB (with required timestamps) -----
+        async with AsyncSessionLocal() as db:
+            try:
+                now_utc = datetime.now(timezone.utc)  # timezone-aware
+                ai_msg = Message(
+                    id=uuid.uuid4(),
+                    conversation_id=conv_uuid,
+                    direction="outbound",
+                    mode="ai",
+                    message_type="text",
+                    content=ai_response,
+                    is_ai_generated=True,
+                    status="sent",
+                    created_at=now_utc,
+                    whatsapp_message_id=wamid,
+                    whatsapp_timestamp=int(now_utc.timestamp()),
+                    sort_timestamp=now_utc,
+                    status_updated_at=now_utc 
+                )
+                db.add(ai_msg)
+                await db.execute(
+                    text("UPDATE conversations SET last_message_at = NOW() WHERE id = :conv_id"),
+                    {"conv_id": conversation_id}
+                )
+                await db.commit()
+                logger.info("Stored AI reply")
+            except Exception as e:
+                logger.error(f"Failed to store message: {e}")
+                await db.rollback()
+    finally:
+        await manager.send_typing_stop(str(org_id), str(conv_uuid))
     # ----- Lead creation / update -----
     final_lead_data = {}  # define outside for booking block
     if is_lead:

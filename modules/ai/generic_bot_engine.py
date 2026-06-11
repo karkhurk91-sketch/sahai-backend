@@ -2,6 +2,8 @@
 import re
 import logging
 from typing import Dict, Any, List, Optional, Tuple
+from modules.websocket import manager  # add at top
+
 
 logger = logging.getLogger(__name__)
 

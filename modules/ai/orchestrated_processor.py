@@ -376,6 +376,7 @@ class OrchestratedProcessor:
                         id=uuid.uuid4(),
                         conversation_id=uuid.UUID(conversation_id),
                         direction="outbound",
+                        mode="ai",
                         content=ai_response,
                         is_ai_generated=True,
                         status="sent",

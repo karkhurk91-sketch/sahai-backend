@@ -81,7 +81,7 @@ class MessageOrderingService:
             content=content,
             whatsapp_timestamp=whatsapp_timestamp,
             sort_timestamp=sort_timestamp,
-            sender=sender,
+            mode=("user" if sender == "user" else ("bot" if sender == "bot" else "ai")),
             media_url=media_url,
             created_at=datetime.utcnow()
         )

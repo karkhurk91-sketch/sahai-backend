@@ -76,6 +76,7 @@ async def receive_webhook(
             new_message = Message(
                 id=uuid.uuid4(),
                 conversation_id=conv.id,
+                mode="user",
                 direction="inbound",
                 content=text,
                 is_ai_generated=False,
