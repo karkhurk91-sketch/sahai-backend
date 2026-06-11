@@ -176,7 +176,7 @@ class WhatsAppService:
         self.api_version = "v21.0"
         self.base_url = "https://graph.facebook.com"
 
-    async def send_location_message(self, to_number: str, latitude: float, longitude: float, address: str = None) -> Tuple[bool, Optional[str]]:
+    async def send_location_message(self, to_number: str, latitude: float, longitude: float, name: str, address: str) -> Tuple[bool, Optional[str]]:
         """Send a location message using WhatsApp Cloud API."""
         payload = {
             "messaging_product": "whatsapp",
@@ -185,8 +185,8 @@ class WhatsAppService:
             "location": {
                 "latitude": latitude,
                 "longitude": longitude,
-                "name": address or "Location",
-                "address": address or ""
+                "name": name,
+                "address": address
             }
         }
         try:

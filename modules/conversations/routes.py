@@ -406,6 +406,80 @@ async def upload_media(
         "status": "sent",
         "media_url": local_url
     }
+
+
+# ---------- Send Location Message ----------
+class LocationSendRequest(BaseModel):
+    latitude: float
+    longitude: float
+    name: str
+    address: str
+
+@router.post("/{conv_id}/send-location", response_model=None)
+async def send_location(
+    conv_id: UUID,
+    request: LocationSendRequest,
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+) -> Any:
+    org_id = current_user.get("org_id")
+    user_id = current_user.get("user_id")
+    if not org_id or not user_id:
+        raise HTTPException(403, "Authentication required")
+    
+    # Verify conversation exists and user has access
+    conv = await db.get(Conversation, conv_id)
+    if not conv or str(conv.organization_id) != org_id:
+        raise HTTPException(404, "Conversation not found")
+    
+    # Get WhatsApp config
+    whatsapp_config = await get_whatsapp_config(org_id)
+    if not whatsapp_config:
+        raise HTTPException(400, "WhatsApp configuration missing")
+    
+    whatsapp_service = WhatsAppService(
+        whatsapp_config['access_token'],
+        whatsapp_config['phone_number_id']
+    )
+    
+    # Send location using WhatsApp API
+    success, wamid = await whatsapp_service.send_location_message(
+        to_number=conv.customer_phone_number,
+        latitude=request.latitude,
+        longitude=request.longitude,
+        name=request.name,
+        address=request.address
+    )    
+    
+    if not success:
+        raise HTTPException(502, "Failed to send location message")
+    
+    # Store message in database
+    now_utc = datetime.now(timezone.utc)
+    message = Message(
+        id=uuid.uuid4(),
+        conversation_id=conv_id,
+        direction="outbound",
+        mode="human",
+        message_type="location",
+        content=request.address or f"Location: {request.latitude}, {request.longitude}",
+        is_ai_generated=False,
+        human_agent_id=UUID(user_id),
+        status="sent",
+        created_at=now_utc,
+        sort_timestamp=now_utc,
+        whatsapp_message_id=wamid,
+        whatsapp_timestamp=int(now_utc.timestamp()),
+        status_updated_at=now_utc
+    )
+    db.add(message)
+    await db.commit()
+    
+    return {
+        "message_id": str(message.id),
+        "whatsapp_message_id": wamid,
+        "status": "sent"
+    }    
 # ---------- Media Fetch Endpoint ----------
 @router.get("/{conv_id}/media/{message_id}", response_model=None)
 async def fetch_message_media(
