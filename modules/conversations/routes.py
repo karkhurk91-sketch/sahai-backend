@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_
 
 from modules.common.database import get_db
+from modules.auth.dependencies import require_permission
 from modules.common.models import User, Organization, Conversation, Message, Customer
 from modules.auth.jwt import get_current_user
 from modules.common.logger import get_logger
@@ -26,7 +27,7 @@ from .schemas import MessageCreate, NoteCreate, TagCreate, AssignAgentRequest, C
 from .utils import get_media_type_and_limit
 
 logger = get_logger(__name__)
-router = APIRouter(prefix="/api/conversations", tags=["Conversations"])
+router = APIRouter(prefix="/api/conversations", tags=["Conversations"], dependencies=[Depends(require_permission("manage_conversations"))])
 
 # ---------- Helper: Download and save media ----------
 async def download_and_save_media(media_id: str, filename: str, mime_type: str, org_id: str, message_id: uuid.UUID) -> tuple[str, str]:

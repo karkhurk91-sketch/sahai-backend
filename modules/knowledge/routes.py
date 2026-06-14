@@ -4,6 +4,7 @@ from sqlalchemy import select
 from modules.common.database import get_db
 from modules.common.models import KnowledgeDocument
 from modules.auth.jwt import get_current_user
+from modules.auth.dependencies import require_permission
 from modules.ai.rag import index_document
 from modules.common.logger import get_logger
 import os
@@ -11,7 +12,7 @@ import shutil
 import uuid
 
 logger = get_logger(__name__)
-router = APIRouter(prefix="/api/knowledge", tags=["Knowledge Base"])
+router = APIRouter(prefix="/api/knowledge", tags=["Knowledge Base"], dependencies=[Depends(require_permission("manage_knowledge_base"))])
 
 UPLOAD_DIR = "uploads/knowledge"
 os.makedirs(UPLOAD_DIR, exist_ok=True)

@@ -4,6 +4,7 @@ from sqlalchemy import select, update, func
 from modules.common.database import get_db
 from modules.common.models import Customer, Organization
 from modules.auth.jwt import get_current_user
+from modules.auth.dependencies import require_permission
 from modules.common.masking import MaskingConfig, apply_masking_to_dict
 from pydantic import BaseModel
 from uuid import UUID
@@ -11,7 +12,7 @@ from typing import List, Optional
 from datetime import datetime
 import pandas as pd
 
-router = APIRouter(prefix="/api/customers", tags=["Customers"])
+router = APIRouter(prefix="/api/customers", tags=["Customers"], dependencies=[Depends(require_permission("manage_customers"))])
 
 class CustomerCreate(BaseModel):
     phone_number: str

@@ -9,6 +9,7 @@ from datetime import datetime
 from modules.common.database import get_db
 from modules.common.models import BotConfig
 from modules.auth.jwt import get_current_user
+from modules.auth.dependencies import require_permission
 from modules.bot_builder.schemas import (
     BotConfigCreate, BotConfigUpdate, BotConfigResponse,
     BotConfigListResponse
@@ -18,7 +19,7 @@ from modules.bot_builder.analytics import router as analytics_router
 
 
 logger = get_logger(__name__)
-router = APIRouter(prefix="/api/bots", tags=["Bot Builder"])
+router = APIRouter(prefix="/api/bots", tags=["Bot Builder"], dependencies=[Depends(require_permission("manage_bot_builder"))])
 
 # ---------- Helper: validate JSON config schema ----------
 def validate_config_schema(config: dict):

@@ -9,12 +9,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.utils import get_openapi
-from sqlalchemy import text
 
 from modules.common.config import APP_NAME
 from modules.common.database import engine, Base
 from modules.common.logger import get_logger
-from modules.websocket import manager 
+from modules.websocket import manager
 
 # Import all routers
 from modules.message.webhook import router as webhook_router
@@ -44,14 +43,13 @@ from modules.team import router as team_router
 from modules.whatsapp_templates import router as whatsapp_templates_router
 from modules.broadcast.groups_routes import router as broadcast_groups_router
 from modules.bot_builder.routes import router as bot_builder_router
-from modules.bot_builder.analytics import router as analytics_router
-
-
+from modules.bot_builder.analytics import router as bot_analytics_router   # renamed to avoid conflict
+from modules.admin import permissions_routes
 
 logger = get_logger(__name__)
 app = FastAPI(title=APP_NAME)
 
-# ---------- OpenAPI Security Scheme ----------
+# ---------- OpenAPI Security Scheme (for Swagger UI) ----------
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
@@ -65,7 +63,7 @@ def custom_openapi():
         "BearerAuth": {
             "type": "http",
             "scheme": "bearer",
-            "bearerFormat": "JWT"
+            "bearerFormat": "JWT",
         }
     }
     openapi_schema["security"] = [{"BearerAuth": []}]
@@ -85,7 +83,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://localhost:8000",
         "https://wabot-backend-geky.onrender.com",
-        "https://wabot-dashboard-one.vercel.app"
+        "https://wabot-dashboard-one.vercel.app",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -105,31 +103,29 @@ app.include_router(ai_config_router)
 app.include_router(conv_router)
 app.include_router(customers_router)
 app.include_router(knowledge_router)
-app.include_router(analytics_router)
+app.include_router(analytics_router)          # from modules/analytics/routes.py
 app.include_router(chat_router)
 app.include_router(bookings_router)
 app.include_router(admin_prompts_router)
-# app.include_router(admin_ai_test_router)  # commented out
+# app.include_router(admin_ai_test_router)    # commented out
 app.include_router(blog_router)
 app.include_router(messages_router)
 app.include_router(webhooks_router)
 app.include_router(campaigns_router)
 app.include_router(social_router)
-app.include_router(partners_router) 
+app.include_router(partners_router)
 app.include_router(team_router)
 app.include_router(whatsapp_templates_router)
 app.include_router(broadcast_groups_router)
 app.include_router(bot_builder_router)
-app.include_router(analytics_router)
-
-
+app.include_router(bot_analytics_router)     # from modules/bot_builder/analytics.py
+app.include_router(permissions_routes.router)
 
 # ---------- Startup / Shutdown ----------
 @app.on_event("startup")
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    #await run_migration()
     logger.info("Database tables initialized and schema up to date")
 
 @app.on_event("shutdown")

@@ -4,11 +4,12 @@ from sqlalchemy import select
 from modules.common.database import get_db
 from modules.common.models import AIConfig
 from modules.auth.jwt import get_current_user, get_current_super_admin
+from modules.auth.dependencies import require_permission
 from pydantic import BaseModel
 from typing import Optional
 from uuid import UUID
 
-router = APIRouter(prefix="/api/ai/config", tags=["AI Config"])
+router = APIRouter(prefix="/api/ai/config", tags=["AI Config"], dependencies=[Depends(require_permission("manage_ai_prompts"))])
 
 class AIConfigUpdate(BaseModel):
     system_prompt: Optional[str] = None

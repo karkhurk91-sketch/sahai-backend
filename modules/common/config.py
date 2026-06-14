@@ -81,3 +81,8 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 FROM_EMAIL = os.getenv("FROM_EMAIL", SMTP_USER)
+
+
+
+# Permission matrix feature flag
+ENABLE_ROLE_PERMISSIONS = os.getenv("ENABLE_ROLE_PERMISSIONS", "false").lower() == "true"

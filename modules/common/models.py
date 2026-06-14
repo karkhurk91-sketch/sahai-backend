@@ -511,3 +511,19 @@ class BotConfig(Base):
     __table_args__ = (
         Index("idx_bot_configs_org_active", "organization_id", "is_active"),
     )
+
+# ========== Role & RolePermission for Permission Matrix ==========
+class Role(Base):
+    __tablename__ = "roles"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(50), unique=True, nullable=False)
+    description = Column(Text)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    permissions = relationship("Permission", secondary="role_permissions", backref="roles", lazy='raise')
+
+class RolePermission(Base):
+    __tablename__ = "role_permissions"
+    role_id = Column(UUID(as_uuid=True), ForeignKey("roles.id", ondelete="CASCADE"), primary_key=True)
+    permission_id = Column(UUID(as_uuid=True), ForeignKey("permissions.id", ondelete="CASCADE"), primary_key=True)
+# ========== End of Permission Matrix additions ==========

@@ -17,6 +17,7 @@ from groq import Groq
 from modules.common.database import get_db
 from modules.common.models import Campaign, CampaignCreative, CampaignMeta, Organization, OrganizationChannel
 from modules.auth.jwt import get_current_user
+from modules.auth.dependencies import require_permission
 from modules.common.logger import get_logger
 from modules.common.config import GROQ_API_KEY, API_BASE_URL
 from modules.social.factory import SocialFactory
@@ -24,7 +25,7 @@ from modules.common.models import SocialAccount, SocialAdCampaign
 
 
 logger = get_logger(__name__)
-router = APIRouter(prefix="/api/campaign", tags=["Campaign"])
+router = APIRouter(prefix="/api/campaign", tags=["Campaign"], dependencies=[Depends(require_permission("manage_campaigns"))])
 
 # ---------- Groq client ----------
 _groq_client = Groq(api_key=GROQ_API_KEY)

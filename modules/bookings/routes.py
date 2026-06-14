@@ -4,11 +4,12 @@ from sqlalchemy import select, func, and_
 from modules.common.database import get_db
 from modules.common.models import Booking
 from modules.auth.jwt import get_current_user
+from modules.auth.dependencies import require_permission
 from datetime import datetime, timedelta
 from typing import Optional
 from uuid import UUID
 
-router = APIRouter(prefix="/api/bookings", tags=["Bookings"])
+router = APIRouter(prefix="/api/bookings", tags=["Bookings"], dependencies=[Depends(require_permission("manage_bookings"))])
 
 @router.get("")
 async def list_bookings(

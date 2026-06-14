@@ -2,8 +2,10 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
 from datetime import datetime, timedelta
-from modules.common.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES
+from modules.common.config import SECRET_KEY, ALGORITHM, ACCESS_TOKEN_EXPIRE_MINUTES, ENABLE_ROLE_PERMISSIONS
 from modules.common.redis_client import get_redis
+from modules.auth.permissions import get_effective_permissions
+
 import bcrypt
 
 security = HTTPBearer()
@@ -87,13 +89,15 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         if payload.get("type") != "access":
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type")
 
+        # Return all relevant claims, including permissions
         return {
             "sub": payload.get("sub"),
             "email": payload.get("email"),
             "role": payload.get("role"),
             "org_id": payload.get("org_id"),
             "user_id": payload.get("user_id"),
-            "partner_id": payload.get("partner_id")
+            "partner_id": payload.get("partner_id"),
+            "permissions": payload.get("permissions", [])   # <-- ADDED
         }
     except JWTError:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")

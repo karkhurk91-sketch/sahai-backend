@@ -6,6 +6,7 @@ from uuid import UUID
 
 from modules.common.database import get_db, AsyncSessionLocal
 from modules.auth.jwt import get_current_user
+from modules.auth.dependencies import require_permission
 from modules.common.logger import get_logger
 from modules.common.models import Customer
 from .models import WhatsAppTemplate
@@ -13,7 +14,7 @@ from .schemas import TemplateCreate, SendTemplateDynamicRequest
 from .service import WhatsAppTemplateService
 
 logger = get_logger(__name__)
-router = APIRouter(prefix="/api/whatsapp/templates", tags=["WhatsApp Templates"])
+router = APIRouter(prefix="/api/whatsapp/templates", tags=["WhatsApp Templates"], dependencies=[Depends(require_permission("manage_templates"))])
 
 @router.get("/sync")
 async def sync_templates(

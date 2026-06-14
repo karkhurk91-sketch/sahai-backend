@@ -10,12 +10,13 @@ from typing import List, Optional
 from modules.common.database import get_db
 from modules.common.models import BroadcastTemplate, BroadcastHistory, Customer, Organization, OrganizationChannel
 from modules.auth.jwt import get_current_user
+from modules.auth.dependencies import require_permission
 from modules.message.sender import send_whatsapp_template   # expects org_id
 from modules.messages.service import send_message
 from modules.common.logger import get_logger
 
 logger = get_logger(__name__)
-router = APIRouter(prefix="/api/broadcast", tags=["Broadcast"])
+router = APIRouter(prefix="/api/broadcast", tags=["Broadcast"], dependencies=[Depends(require_permission("manage_broadcast"))])
 
 # ---------- Pydantic models ----------
 class TemplateCreate(BaseModel):

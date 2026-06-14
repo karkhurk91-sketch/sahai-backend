@@ -4,15 +4,18 @@ from sqlalchemy import select, or_
 from modules.common.database import get_db
 from modules.common.models import User, Conversation, Lead, LeadSchema, Organization
 from modules.auth.jwt import get_current_user
+from modules.auth.dependencies import require_permission
 from modules.common.masking import MaskingConfig, apply_masking_to_dict
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 from uuid import UUID
 from datetime import datetime
 from modules.auth.routes import get_current_user
+from modules.auth.dependencies import require_permission
+
 import uuid
 
-router = APIRouter(prefix="/api/leads", tags=["Leads"])
+router = APIRouter(prefix="/api/leads", tags=["Leads"], dependencies=[Depends(require_permission("manage_leads"))])
 
 class LeadSchemaBase(BaseModel):
     name: str
@@ -26,7 +29,8 @@ class LeadUpdate(BaseModel):
 @router.get("")
 async def list_leads(
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(get_current_user),
+    _=Depends(require_permission("manage_leads"))
 ):
     org_id = current_user.get("org_id")
     query = select(Lead).order_by(Lead.created_at.desc())
@@ -71,7 +75,8 @@ def _serialize_model(model):
 async def create_lead_schema(
     payload: LeadSchemaBase,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(get_current_user),
+    _=Depends(require_permission("manage_leads"))
 ):
     org_id = current_user.get("org_id")
     if not org_id:
@@ -93,7 +98,8 @@ async def create_lead_schema(
 @router.get("/schemas")
 async def list_lead_schemas(
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(get_current_user),
+    _=Depends(require_permission("manage_leads"))
 ):
     org_id = current_user.get("org_id")
     query = select(LeadSchema).where(LeadSchema.organization_id == org_id, LeadSchema.is_active == True)
@@ -106,7 +112,8 @@ async def list_lead_schemas(
 async def get_lead_schema(
     schema_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(get_current_user),
+    _=Depends(require_permission("manage_leads"))
 ):
     org_id = current_user.get("org_id")
     query = select(LeadSchema).where(LeadSchema.id == schema_id, LeadSchema.organization_id == org_id)
@@ -122,7 +129,8 @@ async def update_lead_schema(
     schema_id: UUID,
     payload: LeadSchemaBase,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(get_current_user),
+    _=Depends(require_permission("manage_leads"))
 ):
     org_id = current_user.get("org_id")
     query = select(LeadSchema).where(LeadSchema.id == schema_id, LeadSchema.organization_id == org_id)
@@ -143,7 +151,8 @@ async def update_lead_schema(
 async def delete_lead_schema(
     schema_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(get_current_user),
+    _=Depends(require_permission("manage_leads"))
 ):
     org_id = current_user.get("org_id")
     query = select(LeadSchema).where(LeadSchema.id == schema_id, LeadSchema.organization_id == org_id)
@@ -160,7 +169,8 @@ async def delete_lead_schema(
 async def get_lead_by_conversation(
     conv_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(get_current_user),
+    _=Depends(require_permission("manage_leads"))
 ):
     org_id = current_user.get("org_id")
     conversation_result = await db.execute(
@@ -197,7 +207,8 @@ async def get_lead_by_conversation(
 @router.get("/analytics/summary")
 async def get_lead_analytics_summary(
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(get_current_user),
+    _=Depends(require_permission("manage_leads"))
 ):
     org_id = current_user.get("org_id")
     query = select(Lead).where(Lead.organization_id == org_id)
@@ -234,7 +245,8 @@ async def update_lead(
     lead_id: UUID,
     update: LeadUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(get_current_user),
+    _=Depends(require_permission("manage_leads"))
 ):
     org_id = current_user.get("org_id")
     # Find lead, ensuring it belongs to the organization
@@ -253,7 +265,8 @@ async def update_lead(
 async def get_lead_by_conversation(
     conversation_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user),
+    _=Depends(require_permission("manage_leads"))
 ):
     org_id = current_user.get("org_id")
     stmt = select(Lead).where(

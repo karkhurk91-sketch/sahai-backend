@@ -5,9 +5,10 @@ from datetime import datetime, timedelta
 from modules.common.database import get_db
 from modules.common.models import Message, Conversation, Lead, Customer
 from modules.auth.jwt import get_current_user, get_current_super_admin
+from modules.auth.dependencies import require_permission
 from typing import Optional
 
-router = APIRouter(prefix="/api/analytics", tags=["Analytics"])
+router = APIRouter(prefix="/api/analytics", tags=["Analytics"], dependencies=[Depends(require_permission("view_analytics"))])
 @router.get("/activity")
 async def get_activity(
     period: str = Query("daily", pattern="^(daily|weekly|monthly|yearly)$"),

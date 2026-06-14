@@ -19,14 +19,46 @@ class OrganizationCreate(BaseModel):
     plan: str = "basic"
 
 @router.get("")
-async def list_organizations(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Organization))
+async def list_organizations(
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    role = current_user.get("role")
+    if role == "super_admin":
+        result = await db.execute(select(Organization))
+    elif role == "partner":
+        partner_id = current_user.get("partner_id")
+        if not partner_id:
+            raise HTTPException(403, "Partner ID missing")
+        result = await db.execute(select(Organization).where(Organization.partner_id == partner_id))
+    elif role == "org_admin":
+        # Org admin should only see their own organization (if they have access to this endpoint)
+        org_id = current_user.get("org_id")
+        if not org_id:
+            raise HTTPException(403, "Organization ID missing")
+        result = await db.execute(select(Organization).where(Organization.id == org_id))
+    else:
+        raise HTTPException(403, "Not authorized")
     orgs = result.scalars().all()
     return orgs
 
 @router.post("")
-async def create_organization(org: OrganizationCreate, db: AsyncSession = Depends(get_db)):
+async def create_organization(
+    org: OrganizationCreate,
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    role = current_user.get("role")
+    if role not in ["super_admin", "partner"]:
+        raise HTTPException(403, "Only super admin or partner can create organizations")
+    
     new_org = Organization(name=org.name, business_type=org.business_type, plan=org.plan)
+    if role == "partner":
+        partner_id = current_user.get("partner_id")
+        if not partner_id:
+            raise HTTPException(403, "Partner ID missing")
+        new_org.partner_id = partner_id
+    # super_admin can optionally set partner_id via request body, but we'll ignore for simplicity.
     db.add(new_org)
     await db.commit()
     await db.refresh(new_org)
@@ -49,8 +81,25 @@ async def get_org_channels(
     return result.scalars().all()
 
 @router.get("/{org_id}")
-async def get_organization(org_id: UUID, db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(Organization).where(Organization.id == org_id))
+async def get_organization(
+    org_id: UUID,
+    current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    role = current_user.get("role")
+    # Super admin can see any org; partner can only see their own; org admin only their own.
+    query = select(Organization).where(Organization.id == org_id)
+    if role == "partner":
+        partner_id = current_user.get("partner_id")
+        query = query.where(Organization.partner_id == partner_id)
+    elif role == "org_admin":
+        user_org_id = current_user.get("org_id")
+        if str(user_org_id) != str(org_id):
+            raise HTTPException(403, "Access denied")
+    elif role != "super_admin":
+        raise HTTPException(403, "Not authorized")
+    
+    result = await db.execute(query)
     org = result.scalar_one_or_none()
     if not org:
         raise HTTPException(404, "Organization not found")
@@ -145,7 +194,7 @@ async def delete_conversation_flow(
         raise HTTPException(404, "Conversation flow not found")
     return {"status": "deleted"}
 
-# ---------- New Profile & Password endpoints ----------
+# ---------- Profile & Password endpoints ----------
 class ProfileUpdate(BaseModel):
     name: Optional[str] = None
     business_type: Optional[str] = None
@@ -207,7 +256,6 @@ async def get_message_counts(current_user = Depends(get_current_user), db: Async
     )
     row = result.fetchone()
     return {"marketing": row[0] or 0, "utility": row[1] or 0}
-
 
 # ---------- Data Masking Settings endpoints ----------
 class MaskingSettingsUpdate(BaseModel):
@@ -286,6 +334,3 @@ async def update_masking_settings(
         "phone_partial": settings_update.phone_partial,
         "email_partial": settings_update.email_partial,
     }
-# Add to modules/organizations/routes.py
-
-
