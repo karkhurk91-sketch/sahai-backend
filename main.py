@@ -45,6 +45,7 @@ from modules.broadcast.groups_routes import router as broadcast_groups_router
 from modules.bot_builder.routes import router as bot_builder_router
 from modules.bot_builder.analytics import router as bot_analytics_router   # renamed to avoid conflict
 from modules.admin import permissions_routes
+from modules.digitalmarketing.facebook.routes import router as facebook_router
 
 logger = get_logger(__name__)
 app = FastAPI(title=APP_NAME)
@@ -120,6 +121,7 @@ app.include_router(broadcast_groups_router)
 app.include_router(bot_builder_router)
 app.include_router(bot_analytics_router)     # from modules/bot_builder/analytics.py
 app.include_router(permissions_routes.router)
+app.include_router(facebook_router)
 
 # ---------- Startup / Shutdown ----------
 @app.on_event("startup")
