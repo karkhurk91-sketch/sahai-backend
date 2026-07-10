@@ -13,6 +13,7 @@ from fastapi.openapi.utils import get_openapi
 from modules.common.config import APP_NAME
 from modules.common.database import engine, Base
 from modules.common.logger import get_logger
+from modules.common.schema_bootstrap import ensure_required_columns
 from modules.websocket import manager
 
 # Import all routers
@@ -26,6 +27,7 @@ from modules.leads.followup_routes import router as followup_router
 from modules.broadcast.routes import router as broadcast_router
 from modules.ai_config.routes import router as ai_config_router
 from modules.conversations.routes import router as conv_router
+from modules.conversations.quick_reply_routes import router as quick_reply_router
 from modules.customers.routes import router as customers_router
 from modules.knowledge.routes import router as knowledge_router
 from modules.analytics.routes import router as analytics_router
@@ -102,6 +104,7 @@ app.include_router(followup_router)
 app.include_router(broadcast_router)
 app.include_router(ai_config_router)
 app.include_router(conv_router)
+app.include_router(quick_reply_router)
 app.include_router(customers_router)
 app.include_router(knowledge_router)
 app.include_router(analytics_router)          # from modules/analytics/routes.py
@@ -128,6 +131,7 @@ app.include_router(facebook_router)
 async def startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(ensure_required_columns)
     logger.info("Database tables initialized and schema up to date")
 
 @app.on_event("shutdown")

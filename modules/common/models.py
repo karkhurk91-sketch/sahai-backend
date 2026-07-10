@@ -88,9 +88,26 @@ class Customer(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     opt_in = Column(Boolean, default=False)
+    profile_picture = Column(String(500), nullable=True)
     __table_args__ = (
         Index("ix_customers_org_phone", organization_id, phone_number, unique=True),
     )
+
+
+class QuickReply(Base):
+    __tablename__ = "quick_replies"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(100), nullable=False)
+    content = Column(Text, nullable=False)
+    category = Column(String(50), default="general")
+    is_shared = Column(Boolean, default=False)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    organization = relationship("Organization")
+    creator = relationship("User", foreign_keys=[created_by])
 
 
 class User(Base):
@@ -129,6 +146,8 @@ class Conversation(Base):
     closed_at = Column(DateTime(timezone=True))
     assigned_agent_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     unread_count = Column(Integer, default=0)
+    is_starred = Column(Boolean, default=False)
+    starred_at = Column(DateTime(timezone=True), nullable=True)
     last_customer_message_at = Column(DateTime, nullable=True)  # without timezone=True
     custom_fields = Column(JSON, default={})
     # New state machine fields (Phase 1 stabilization)

@@ -3,7 +3,7 @@ from typing import List, Optional, Dict, Any
 from uuid import UUID
 from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, desc, delete as sql_delete, func, update
+from sqlalchemy import select, desc, delete as sql_delete, func, update, and_, or_, cast, String
 
 from modules.common.models import Conversation, Message, Tag, ConversationTag, ConversationNote, Organization, User, ConversationAssignmentHistory, Customer
 from modules.common.logger import get_logger
@@ -58,17 +58,58 @@ class ConversationService:
             return "breached", minutes_left
         return "on_time", minutes_left
 
+    def _get_preview_text(self, conversation_data: Dict[str, Any]) -> str:
+        last_message = conversation_data.get("last_message") or {}
+        if not last_message:
+            return "No messages yet"
+        message_type = (last_message.get("message_type") or "").lower()
+        if message_type in {"image", "video", "audio", "document"}:
+            icon_map = {"image": "📷", "video": "🎥", "audio": "🔊", "document": "📎"}
+            return f"{icon_map[message_type]} Media"
+        text = str(last_message.get("text") or last_message.get("content") or "").strip()
+        if not text:
+            return "No messages yet"
+        if len(text) <= 30:
+            return text
+        cutoff = 30
+        if ' ' in text[:cutoff]:
+            truncated = text[:cutoff].rstrip()
+            last_space = truncated.rfind(' ')
+            if last_space > 0:
+                truncated = truncated[:last_space].rstrip()
+                return f"{truncated}..."
+        return f"{text[:cutoff].rstrip()}..."
+
+    def _matches_filter(self, conversation_data: Dict[str, Any], filter_type: Optional[str]) -> bool:
+        if not filter_type or filter_type == 'all':
+            return True
+        conv = conversation_data
+        if filter_type == 'assigned_to_me':
+            return bool(conv.get("assigned_agent_id") and str(conv.get("assigned_agent_id")) == str(conv.get("current_user_id")))
+        if filter_type == 'unassigned':
+            return not conv.get("assigned_agent_id")
+        if filter_type == 'unread':
+            return int(conv.get("unread_count") or 0) > 0
+        if filter_type == 'starred':
+            return bool(conv.get("is_starred"))
+        if filter_type == 'pending':
+            last_customer_message_at = conv.get("last_customer_message_at")
+            last_message_at = conv.get("last_message_at")
+            return bool(last_customer_message_at and last_message_at and last_customer_message_at > last_message_at)
+        if filter_type == 'awaiting_reply':
+            last_customer_message_at = conv.get("last_customer_message_at")
+            last_message_at = conv.get("last_message_at")
+            return bool(last_message_at and last_customer_message_at and last_message_at > last_customer_message_at)
+        if filter_type == 'sla_breached':
+            return conv.get("sla_status") == 'breached'
+        return True
+
     async def list_conversations(self, org_id: UUID, user_id: UUID, user_role: str, filter_type: Optional[str] = None) -> List[Dict[str, Any]]:
         conversations = await self._get_conversations_for_user(org_id, user_id, user_role)
 
         org_result = await self.session.execute(select(Organization).where(Organization.id == org_id))
         org = org_result.scalar_one_or_none()
         masking_config = MaskingConfig.from_dict(org.settings or {}) if org else MaskingConfig()
-
-        if filter_type == 'assigned_to_me':
-            conversations = [c for c in conversations if c.assigned_agent_id == user_id]
-        elif filter_type == 'unassigned':
-            conversations = [c for c in conversations if c.assigned_agent_id is None]
 
         agent_ids = {c.assigned_agent_id for c in conversations if c.assigned_agent_id}
         agent_names: Dict[UUID, str] = {}
@@ -79,14 +120,29 @@ class ConversationService:
 
         output = []
         for conv in conversations:
+            customer_row = await self.session.execute(
+                select(Customer).where(
+                    Customer.organization_id == org_id,
+                    Customer.deleted_at.is_(None),
+                    func.replace(Customer.phone_number, '+', '') == conv.customer_phone_number,
+                ).limit(1)
+            )
+            customer = customer_row.scalar_one_or_none()
+            customer_name = getattr(customer, 'name', None) or conv.customer_name
+            customer_phone = getattr(customer, 'phone_number', None) or conv.customer_phone_number
+            customer_profile_picture = getattr(customer, 'profile_picture', None) if customer else None
+
             last_msgs = await self.msg_repo.get_by_conversation(conv.id, limit=1)
             last_msg = last_msgs[0] if last_msgs else None
             last_msg_data = None
+            last_message_sender = 'customer'
             if last_msg:
+                last_message_sender = 'customer' if last_msg.direction == 'inbound' else ('bot' if getattr(last_msg, 'is_ai_generated', False) else 'agent')
                 last_msg_data = {
                     "id": str(last_msg.id),
                     "text": last_msg.content,
                     "sender_type": last_msg.direction,
+                    "sender_label": last_message_sender,
                     "created_at": last_msg.created_at.isoformat(),
                     "status": last_msg.status,
                     "message_type": last_msg.message_type,
@@ -96,30 +152,47 @@ class ConversationService:
             if org:
                 sla_status, minutes_left = await self._compute_sla_status(conv, org)
 
-            if filter_type == 'sla_breached' and sla_status != 'breached':
-                continue
-
             conv_data = {
                 "id": str(conv.id),
-                "customer_phone_number": conv.customer_phone_number,
-                "customer_name": conv.customer_name,
+                "organization_id": str(conv.organization_id),
+                "customer_phone_number": customer_phone or conv.customer_phone_number,
+                "customer_name": customer_name or conv.customer_name,
+                "customer_email": getattr(customer, 'email', None),
+                "profile_picture": customer_profile_picture,
+                "status": conv.status,
+                "lead_score": conv.lead_score,
+                "service": conv.service,
+                "tags": conv.tags or [],
+                "reply_mode": conv.reply_mode,
+                "started_at": conv.started_at.isoformat() if conv.started_at else None,
                 "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
+                "closed_at": conv.closed_at.isoformat() if conv.closed_at else None,
                 "assigned_agent_id": str(conv.assigned_agent_id) if conv.assigned_agent_id else None,
                 "assigned_agent_name": agent_names.get(conv.assigned_agent_id) if conv.assigned_agent_id else None,
-                "reply_mode": conv.reply_mode,
-                "status": conv.status,
-                "last_message": last_msg_data,
                 "unread_count": conv.unread_count or 0,
+                "is_starred": bool(getattr(conv, 'is_starred', False)),
+                "starred_at": conv.starred_at.isoformat() if getattr(conv, 'starred_at', None) else None,
                 "last_customer_message_at": conv.last_customer_message_at.isoformat() if conv.last_customer_message_at else None,
                 "custom_fields": conv.custom_fields or {},
+                "conversation_stage": conv.conversation_stage,
+                "completed_fields": conv.completed_fields,
+                "booking_status": conv.booking_status,
+                "recommendation_shown": conv.recommendation_shown,
+                "last_intent": conv.last_intent,
+                "last_message": last_msg_data,
+                "last_message_preview": self._get_preview_text({"last_message": last_msg_data}),
+                "last_message_sender": last_message_sender,
                 "sla_status": sla_status,
                 "minutes_left": minutes_left,
+                "current_user_id": str(user_id),
             }
             if masking_config.mask_phone and conv_data["customer_phone_number"]:
                 conv_data["customer_phone_number"] = mask_phone_number(
                     conv_data["customer_phone_number"],
                     partial=masking_config.phone_partial,
                 )
+            if not self._matches_filter(conv_data, filter_type):
+                continue
             output.append(conv_data)
         return output
 
@@ -375,13 +448,44 @@ class ConversationService:
             "status": conv.status,
         }
 
-    async def search_conversations(self, org_id: UUID, search_term: str, user_id: UUID, user_role: str) -> List[Dict[str, Any]]:
+    async def search_conversations(self, org_id: UUID, search_term: str, user_id: UUID, user_role: str, search_type: str = 'name_phone') -> List[Dict[str, Any]]:
         allowed_conversations = await self._get_conversations_for_user(org_id, user_id, user_role)
         if not allowed_conversations:
             return []
         allowed_ids = [c.id for c in allowed_conversations]
-        conversations = await self.conv_repo.search_by_phone_or_name(org_id, search_term)
-        conversations = [c for c in conversations if c.id in allowed_ids]
+        if not search_term or not search_term.strip():
+            return await self.list_conversations(org_id, user_id, user_role)
+
+        search_term = search_term.strip()
+        search_pattern = f"%{search_term}%"
+        stmt = select(Conversation).where(Conversation.organization_id == org_id, Conversation.id.in_(allowed_ids))
+
+        if search_type == 'content':
+            message_stmt = select(Message.conversation_id).where(
+                Message.organization_id == org_id,
+                Message.content.ilike(search_pattern),
+            ).distinct()
+            stmt = stmt.where(Conversation.id.in_(message_stmt))
+        elif search_type == 'tags':
+            tag_stmt = select(ConversationTag.conversation_id).join(Tag, ConversationTag.tag_id == Tag.id).where(
+                ConversationTag.conversation_id == Conversation.id,
+                Tag.organization_id == org_id,
+                Tag.name.ilike(search_pattern),
+            ).distinct()
+            stmt = stmt.where(Conversation.id.in_(tag_stmt))
+        elif search_type == 'custom_fields':
+            stmt = stmt.where(cast(Conversation.custom_fields, String).ilike(search_pattern))
+        else:
+            stmt = stmt.where(
+                or_(
+                    Conversation.customer_phone_number.ilike(search_pattern),
+                    Conversation.customer_name.ilike(search_pattern),
+                )
+            )
+
+        result = await self.session.execute(stmt.order_by(desc(Conversation.last_message_at)))
+        conversations = result.scalars().all()
+
         org_result = await self.session.execute(select(Organization).where(Organization.id == org_id))
         org = org_result.scalar_one_or_none()
         masking_config = MaskingConfig.from_dict(org.settings or {}) if org else MaskingConfig()
@@ -393,28 +497,52 @@ class ConversationService:
                 agent_names[ag.id] = ag.full_name or ag.email or str(ag.id)
         output = []
         for conv in conversations:
+            customer_row = await self.session.execute(
+                select(Customer).where(
+                    Customer.organization_id == org_id,
+                    Customer.deleted_at.is_(None),
+                    func.replace(Customer.phone_number, '+', '') == conv.customer_phone_number,
+                ).limit(1)
+            )
+            customer = customer_row.scalar_one_or_none()
+            customer_name = getattr(customer, 'name', None) or conv.customer_name
+            customer_phone = getattr(customer, 'phone_number', None) or conv.customer_phone_number
+            customer_profile_picture = getattr(customer, 'profile_picture', None) if customer else None
+
             last_msgs = await self.msg_repo.get_by_conversation(conv.id, limit=1)
             last_msg = last_msgs[0] if last_msgs else None
             last_msg_data = None
+            last_message_sender = 'customer'
             if last_msg:
+                last_message_sender = 'customer' if last_msg.direction == 'inbound' else ('bot' if getattr(last_msg, 'is_ai_generated', False) else 'agent')
                 last_msg_data = {
                     "id": str(last_msg.id),
                     "text": last_msg.content,
                     "sender_type": last_msg.direction,
+                    "sender_label": last_message_sender,
                     "created_at": last_msg.created_at.isoformat(),
                     "status": last_msg.status,
                     "message_type": last_msg.message_type,
                 }
             conv_data = {
                 "id": str(conv.id),
-                "customer_phone_number": conv.customer_phone_number,
-                "customer_name": conv.customer_name,
+                "organization_id": str(conv.organization_id),
+                "customer_phone_number": customer_phone or conv.customer_phone_number,
+                "customer_name": customer_name or conv.customer_name,
+                "customer_email": getattr(customer, 'email', None),
+                "profile_picture": customer_profile_picture,
                 "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
                 "assigned_agent_id": str(conv.assigned_agent_id) if conv.assigned_agent_id else None,
                 "assigned_agent_name": agent_names.get(conv.assigned_agent_id) if conv.assigned_agent_id else None,
                 "reply_mode": conv.reply_mode,
                 "status": conv.status,
+                "tags": conv.tags or [],
+                "unread_count": conv.unread_count or 0,
+                "is_starred": bool(getattr(conv, 'is_starred', False)),
+                "starred_at": getattr(conv, 'starred_at', None).isoformat() if getattr(conv, 'starred_at', None) else None,
                 "last_message": last_msg_data,
+                "last_message_preview": self._get_preview_text({"last_message": last_msg_data}),
+                "last_message_sender": last_message_sender,
             }
             if masking_config.mask_phone and conv_data["customer_phone_number"]:
                 conv_data["customer_phone_number"] = mask_phone_number(

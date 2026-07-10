@@ -81,7 +81,7 @@ async def serve_local_media(filename: str):
 # ---------- Conversation Routes ----------
 @router.get("", response_model=None)
 async def list_conversations(
-    filter: Optional[str] = Query(None, description="Filter: assigned_to_me, unassigned, sla_breached"),
+    filter: Optional[str] = Query(None, description="Filter: assigned_to_me, unassigned, sla_breached, unread, starred, pending, awaiting_reply"),
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: ConversationService = Depends(get_conversation_service)
@@ -92,70 +92,11 @@ async def list_conversations(
     if not org_id:
         raise HTTPException(403, "Organization not found")
 
-    # Build base query joining conversations with customers
-    # Use func.replace to remove leading '+' from customer phone number
-    stmt = select(
-        Conversation,
-        Customer.name.label("customer_name_from_customer"),
-        Customer.phone_number.label("customer_phone_from_customer"),
-        Customer.email.label("customer_email")
-    ).outerjoin(
-        Customer,
-        and_(
-            Conversation.organization_id == Customer.organization_id,
-            func.replace(Customer.phone_number, '+', '') == Conversation.customer_phone_number,
-            Customer.deleted_at.is_(None)   # ignore soft-deleted customers
-        )
-    ).where(Conversation.organization_id == UUID(org_id))
-
-    # Apply filters
-    if filter == "assigned_to_me":
-        stmt = stmt.where(Conversation.assigned_agent_id == UUID(user_id))
-    elif filter == "unassigned":
-        stmt = stmt.where(Conversation.assigned_agent_id.is_(None))
-    elif filter == "sla_breached":
-        # SLA logic can be added later; for now ignore
-        pass
-
-    stmt = stmt.order_by(Conversation.last_message_at.desc())
-    result = await db.execute(stmt)
-    rows = result.all()
-
-    # Build response list
-    conversations_data = []
-    for row in rows:
-        conv = row.Conversation
-        customer_name = row.customer_name_from_customer or conv.customer_name
-        customer_phone = row.customer_phone_from_customer or conv.customer_phone_number
-        customer_email = row.customer_email
-
-        conv_dict = {
-            "id": str(conv.id),
-            "organization_id": str(conv.organization_id),
-            "customer_phone_number": customer_phone,
-            "customer_name": customer_name,
-            "customer_email": customer_email,
-            "status": conv.status,
-            "lead_score": conv.lead_score,
-            "service": conv.service,
-            "tags": conv.tags or [],
-            "reply_mode": conv.reply_mode,
-            "started_at": conv.started_at.isoformat() if conv.started_at else None,
-            "last_message_at": conv.last_message_at.isoformat() if conv.last_message_at else None,
-            "closed_at": conv.closed_at.isoformat() if conv.closed_at else None,
-            "assigned_agent_id": str(conv.assigned_agent_id) if conv.assigned_agent_id else None,
-            "unread_count": conv.unread_count,
-            "last_customer_message_at": conv.last_customer_message_at.isoformat() if conv.last_customer_message_at else None,
-            "custom_fields": conv.custom_fields,
-            "conversation_stage": conv.conversation_stage,
-            "completed_fields": conv.completed_fields,
-            "booking_status": conv.booking_status,
-            "recommendation_shown": conv.recommendation_shown,
-            "last_intent": conv.last_intent,
-        }
-        conversations_data.append(conv_dict)
-
-    return conversations_data
+    try:
+        return await service.list_conversations(UUID(org_id), UUID(user_id), user_role, filter_type=filter)
+    except Exception as e:
+        logger.error(f"Error listing conversations: {e}")
+        raise HTTPException(500, "Internal server error")
 
 # ---------- Other endpoints unchanged (only import Customer added) ----------
 @router.post("", response_model=None)
@@ -180,6 +121,7 @@ async def create_conversation(
 @router.get("/search", response_model=None)
 async def search_conversations(
     q: str = Query(..., description="Search term for phone number or customer name"),
+    search_type: str = Query("name_phone", description="Search mode: name_phone, content, tags, custom_fields"),
     current_user = Depends(get_current_user),
     service: Any = Depends(get_conversation_service)
 ) -> Any:
@@ -189,7 +131,7 @@ async def search_conversations(
     if not org_id:
         raise HTTPException(403, "Organization not found")
     try:
-        return await service.search_conversations(UUID(org_id), q, UUID(user_id), user_role)
+        return await service.search_conversations(UUID(org_id), q, UUID(user_id), user_role, search_type=search_type)
     except Exception as e:
         logger.error(f"Error searching conversations: {e}")
         raise HTTPException(500, "Internal server error")
