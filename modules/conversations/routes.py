@@ -92,11 +92,13 @@ async def list_conversations(
     if not org_id:
         raise HTTPException(403, "Organization not found")
 
-    #try:
-        return await service.list_conversations(UUID(org_id), UUID(user_id), user_role, filter_type=filter)
-    #except Exception as e:
-    #    logger.error(f"Error listing conversations: {e}")
-    #    raise HTTPException(500, "Internal server error")
+    try:
+        result = await service.list_conversations(UUID(org_id), UUID(user_id), user_role, filter_type=filter)
+        # Ensure result is a list (guard in service, but also here)
+        return result if result is not None else []
+    except Exception as e:
+        logger.error(f"Error listing conversations: {e}")
+        raise HTTPException(500, "Internal server error")
 
 # ---------- Other endpoints unchanged (only import Customer added) ----------
 @router.post("", response_model=None)
@@ -162,6 +164,7 @@ async def send_message(
     conv_id: UUID,
     message: MessageCreate,
     current_user = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
     service: Any = Depends(get_conversation_service)
 ) -> Any:
     org_id = current_user.get("org_id")

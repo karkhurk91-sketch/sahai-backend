@@ -26,8 +26,8 @@ async def _background_media_delivery(
     caption: str,
     org_id: UUID
 ):
-    # ... (keep your existing implementation, unchanged) ...
-    pass  # I'll omit for brevity – you can keep yours
+    # (keep your existing implementation – this placeholder is for brevity)
+    pass
 
 # ========== CONVERSATION SERVICE ==========
 class ConversationService:
@@ -112,6 +112,15 @@ class ConversationService:
 
     async def list_conversations(self, org_id: UUID, user_id: UUID, user_role: str, filter_type: Optional[str] = None) -> List[Dict[str, Any]]:
         conversations = await self._get_conversations_for_user(org_id, user_id, user_role)
+
+        # 👇 SAFETY GUARD – ensure conversations is a list
+        if conversations is None:
+            conversations = []
+            logger.warning(f"list_conversations: _get_conversations_for_user returned None for org {org_id}")
+        if not conversations:
+            return []
+
+        logger.info(f"Processing {len(conversations)} conversations for org {org_id}")
 
         org_result = await self.session.execute(select(Organization).where(Organization.id == org_id))
         org = org_result.scalar_one_or_none()
@@ -200,6 +209,8 @@ class ConversationService:
             if not self._matches_filter(conv_data, filter_type):
                 continue
             output.append(conv_data)
+
+        logger.info(f"Returning {len(output)} conversations after filter")
         return output
 
     # ---------- Get conversation messages ----------
@@ -297,7 +308,7 @@ class ConversationService:
                     message.whatsapp_message_id = wamid
                 else:
                     message.status = "failed"
-                message.status_updated_at = datetime.now(timezone.utc)   # <-- ADD
+                message.status_updated_at = datetime.now(timezone.utc)
                 await self.session.commit()
                 # Broadcast message update via WebSocket
                 from modules.websocket import manager
@@ -323,7 +334,7 @@ class ConversationService:
         org_id: UUID,
         user_id: UUID
     ) -> Dict[str, Any]:
-        # ... keep your existing implementation (unchanged) ...
+        # (keep your existing implementation)
         pass
 
     # ---------- Agent assignment (with history) ----------
