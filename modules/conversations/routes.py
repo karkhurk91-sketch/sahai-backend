@@ -92,11 +92,11 @@ async def list_conversations(
     if not org_id:
         raise HTTPException(403, "Organization not found")
 
-    try:
+    #try:
         return await service.list_conversations(UUID(org_id), UUID(user_id), user_role, filter_type=filter)
-    except Exception as e:
-        logger.error(f"Error listing conversations: {e}")
-        raise HTTPException(500, "Internal server error")
+    #except Exception as e:
+    #    logger.error(f"Error listing conversations: {e}")
+    #    raise HTTPException(500, "Internal server error")
 
 # ---------- Other endpoints unchanged (only import Customer added) ----------
 @router.post("", response_model=None)
@@ -169,8 +169,24 @@ async def send_message(
     user_role = current_user.get("role")
     if not org_id or not user_id:
         raise HTTPException(403, "Authentication required")
+    if message.reply_to_id:
+        original = await db.execute(
+            select(Message).where(
+                Message.id == message.reply_to_id,
+                Message.conversation_id == conv_id,
+            )
+        )
+        if not original.scalar_one_or_none():
+            raise HTTPException(400, "Invalid reply_to_id")
     try:
-        return await service.send_message(conv_id, message.text, UUID(org_id), UUID(user_id), user_role)
+        return await service.send_message(
+            conv_id,
+            message.text,
+            UUID(org_id),
+            UUID(user_id),
+            user_role,
+            reply_to_id=message.reply_to_id,
+        )
     except PermissionError as e:
         raise HTTPException(403, str(e))
     except ValueError as e:
@@ -185,10 +201,20 @@ async def upload_media(
     conv_id: UUID,
     file: UploadFile = File(...),
     caption: Optional[str] = Form(None),
+    reply_to_id: Optional[UUID] = Form(None),
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    if reply_to_id:
+        original = await db.execute(
+            select(Message).where(
+                Message.id == reply_to_id,
+                Message.conversation_id == conv_id,
+            )
+        )
+        if not original.scalar_one_or_none():
+            raise HTTPException(400, "Invalid reply_to_id")
     logger.info(f"upload_media called for conv_id: {conv_id}, file: {file.filename}, size: {file.size}, caption: {caption}")
     org_id = current_user.get("org_id")
     user_id = current_user.get("user_id")

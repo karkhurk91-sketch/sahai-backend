@@ -2,6 +2,7 @@ from typing import List, Optional
 from uuid import UUID
 from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from modules.common.models import Conversation, Message, Tag, ConversationTag, ConversationNote
 from .base import BaseRepository
@@ -72,6 +73,7 @@ class MessageRepository(BaseRepository[Message]):
     async def get_by_conversation(self, conv_id: UUID, limit: int = 50, offset: int = 0) -> List[Message]:
         result = await self.session.execute(
             select(Message)
+            .options(selectinload(Message.reply_to))
             .where(Message.conversation_id == conv_id)
             .order_by(Message.sort_timestamp.asc(), Message.id.asc())
             .limit(limit)

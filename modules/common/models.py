@@ -179,6 +179,7 @@ class Message(Base):
     organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=True)
     whatsapp_timestamp = Column(Integer, nullable=True)
     sort_timestamp = Column(DateTime(timezone=True), nullable=False)
+    reply_to_id = Column(UUID(as_uuid=True), ForeignKey("messages.id", ondelete="SET NULL"), nullable=True)
     
     # NEW COLUMNS FOR PHASE 1
     mode = Column(String(20), nullable=False, server_default='ai', default='ai')
@@ -187,9 +188,12 @@ class Message(Base):
     status_updated_at = Column(DateTime(timezone=True), nullable=True)
     """Timestamp when the status was last updated"""
     
+    reply_to = relationship("Message", remote_side=[id], uselist=False, backref="replies")
+    
     __table_args__ = (
         Index("ix_messages_sort_timestamp", "sort_timestamp"),
         Index("ix_messages_conversation_sort", "conversation_id", "sort_timestamp"),
+        Index("ix_messages_reply_to_id", "reply_to_id"),
     )
 
 class LeadSchema(Base):

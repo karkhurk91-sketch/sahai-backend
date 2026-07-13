@@ -50,9 +50,15 @@ class ConversationService:
     async def _compute_sla_status(self, conv: Conversation, org: Organization) -> tuple[str, int]:
         if not conv.last_customer_message_at:
             return "on_time", 0
+
         sla_minutes = getattr(org, 'sla_minutes', 60)
-        due_time = conv.last_customer_message_at + timedelta(minutes=sla_minutes)
-        now = datetime.now(timezone.utc)  # timezone‑aware
+
+        last_customer_message_at = conv.last_customer_message_at
+        if last_customer_message_at.tzinfo is None:
+            last_customer_message_at = last_customer_message_at.replace(tzinfo=timezone.utc)
+
+        due_time = last_customer_message_at + timedelta(minutes=sla_minutes)
+        now = datetime.now(timezone.utc)
         minutes_left = int((due_time - now).total_seconds() / 60)
         if minutes_left < 0:
             return "breached", minutes_left
@@ -213,7 +219,7 @@ class ConversationService:
                 "id": str(msg.id),
                 "text": msg.content,
                 "sender_type": msg.direction,
-                "direction": msg.direction, 
+                "direction": msg.direction,
                 "created_at": msg.created_at.isoformat(),
                 "sort_timestamp": msg.sort_timestamp.isoformat() if msg.sort_timestamp else msg.created_at.isoformat(),
                 "status": msg.status,
@@ -223,12 +229,19 @@ class ConversationService:
                 "media_file_name": msg.media_file_name,
                 "media_content_type": msg.media_content_type,
                 "whatsapp_message_id": msg.whatsapp_message_id,
+                "reply_to_id": str(msg.reply_to_id) if msg.reply_to_id else None,
+                "reply_to": {
+                    "id": str(msg.reply_to.id),
+                    "text": msg.reply_to.content,
+                    "sender_type": msg.reply_to.direction,
+                    "message_type": msg.reply_to.message_type,
+                } if getattr(msg, 'reply_to', None) else None,
             }
             for msg in messages
         ]
 
     # ---------- Send message ----------
-    async def send_message(self, conv_id: UUID, text: str, org_id: UUID, user_id: UUID, user_role: str) -> Dict[str, Any]:
+    async def send_message(self, conv_id: UUID, text: str, org_id: UUID, user_id: UUID, user_role: str, reply_to_id: Optional[UUID] = None) -> Dict[str, Any]:
         conv = await self.conv_repo.get_by_id(conv_id)
         if not conv or conv.organization_id != org_id:
             raise ValueError("Conversation not found or access denied")
@@ -249,7 +262,8 @@ class ConversationService:
             created_at=datetime.now(timezone.utc),
             sort_timestamp=sort_ts,  # Use current time as sort key
             whatsapp_timestamp=int(sort_ts.timestamp()),
-            status_updated_at=datetime.now(timezone.utc) 
+            status_updated_at=datetime.now(timezone.utc),
+            reply_to_id=reply_to_id,
         )
         message = await self.msg_repo.create(message)
         conv.last_message_at = datetime.utcnow()

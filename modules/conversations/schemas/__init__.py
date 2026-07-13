@@ -5,6 +5,7 @@ from uuid import UUID
 class MessageCreate(BaseModel):
     text: str
     sender_type: str  # 'agent'
+    reply_to_id: Optional[UUID] = None
 
 class NoteCreate(BaseModel):
     note: str
