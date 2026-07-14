@@ -75,7 +75,7 @@ class MessageRepository(BaseRepository[Message]):
             select(Message)
             .options(selectinload(Message.reply_to))
             .where(Message.conversation_id == conv_id)
-            .order_by(Message.sort_timestamp.asc(), Message.id.asc())
+            .order_by(Message.sort_timestamp.desc(), Message.id.asc())
             .limit(limit)
             .offset(offset)
         )
