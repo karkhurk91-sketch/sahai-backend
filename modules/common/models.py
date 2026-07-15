@@ -56,6 +56,8 @@ class Organization(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     partner = relationship("Partner", back_populates="organizations")
     sla_minutes = Column(Integer, default=60)
+    # ✅ Added for Pinned Messages feature
+    max_pinned_messages = Column(Integer, default=3)   # Configurable per org
 
 
 class OrganizationConversationFlow(Base):
@@ -534,6 +536,30 @@ class BotConfig(Base):
     __table_args__ = (
         Index("idx_bot_configs_org_active", "organization_id", "is_active"),
     )
+
+# ========== Pinned Messages ==========
+class PinnedMessage(Base):
+    __tablename__ = "pinned_messages"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    organization_id = Column(UUID(as_uuid=True), ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False)
+    conversation_id = Column(UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
+    message_id = Column(UUID(as_uuid=True), ForeignKey("messages.id", ondelete="CASCADE"), nullable=False)
+    pinned_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=False)
+    pinned_at = Column(DateTime(timezone=True), server_default=func.now())
+    order_index = Column(Integer, default=0)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('conversation_id', 'message_id', name='uq_pin_conv_msg'),
+        Index('idx_pinned_messages_conv', 'conversation_id'),
+        Index('idx_pinned_messages_org', 'organization_id'),
+    )
+
+    # Relationships
+    organization = relationship("Organization")
+    conversation = relationship("Conversation")
+    message = relationship("Message")
+    pinned_by_user = relationship("User", foreign_keys=[pinned_by])
 
 # ========== Role & RolePermission for Permission Matrix ==========
 class Role(Base):

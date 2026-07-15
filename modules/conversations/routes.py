@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from pathlib import Path
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Body, status
 from fastapi.responses import StreamingResponse, FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, and_, or_
@@ -22,12 +22,22 @@ from modules.common.audit import get_audit_service, AuditService
 from modules.message.sender import WhatsAppService, get_whatsapp_config
 
 from modules.conversations.services import ConversationService
+from modules.conversations.services.pinned_message_service import PinnedMessageService
 
 from .schemas import MessageCreate, NoteCreate, TagCreate, AssignAgentRequest, ConversationModeUpdate
 from .utils import get_media_type_and_limit
 
 logger = get_logger(__name__)
-router = APIRouter(prefix="/api/conversations", tags=["Conversations"], dependencies=[Depends(require_permission("manage_conversations"))])
+
+# ---------- Custom permission for pin/unpin ----------
+async def require_pin_permission(current_user = Depends(get_current_user)):
+    permissions = current_user.get("permissions", [])
+    if "manage_pins" in permissions or "manage_conversations" in permissions:
+        return current_user
+    raise HTTPException(status_code=403, detail="Insufficient permissions to pin messages")
+
+# ---------- Router (no global permission) ----------
+router = APIRouter(prefix="/api/conversations", tags=["Conversations"])
 
 # ---------- Helper: Download and save media ----------
 async def download_and_save_media(media_id: str, filename: str, mime_type: str, org_id: str, message_id: uuid.UUID) -> tuple[str, str]:
@@ -61,6 +71,12 @@ def get_conversation_service(
 ) -> ConversationService:
     return ConversationService(db, audit)
 
+def get_pinned_message_service(
+    db: Any = Depends(get_db),
+    audit: Any = Depends(get_audit_service)
+) -> PinnedMessageService:
+    return PinnedMessageService(db, audit)
+
 # WhatsApp official size limits
 SIZE_LIMITS = {
     "image": 5 * 1024 * 1024,
@@ -86,6 +102,11 @@ async def list_conversations(
     db: AsyncSession = Depends(get_db),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    # Check permission
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     user_id = current_user.get("user_id")
     user_role = current_user.get("role")
@@ -94,13 +115,11 @@ async def list_conversations(
 
     try:
         result = await service.list_conversations(UUID(org_id), UUID(user_id), user_role, filter_type=filter)
-        # Ensure result is a list (guard in service, but also here)
         return result if result is not None else []
     except Exception as e:
         logger.error(f"Error listing conversations: {e}")
         raise HTTPException(500, "Internal server error")
 
-# ---------- Other endpoints unchanged (only import Customer added) ----------
 @router.post("", response_model=None)
 async def create_conversation(
     phone_number: str = Body(None, embed=True),
@@ -108,6 +127,10 @@ async def create_conversation(
     current_user = Depends(get_current_user),
     service: Any = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     phone_number = phone_number or phone_number_form
     if not phone_number:
         raise HTTPException(400, "Phone number is required")
@@ -127,6 +150,10 @@ async def search_conversations(
     current_user = Depends(get_current_user),
     service: Any = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     user_id = current_user.get("user_id")
     user_role = current_user.get("role")
@@ -146,6 +173,10 @@ async def get_messages(
     current_user = Depends(get_current_user),
     service: Any = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -159,6 +190,66 @@ async def get_messages(
         logger.error(f"Error getting messages: {e}")
         raise HTTPException(500, "Internal server error")
 
+# ========== PINNED MESSAGES ENDPOINTS (use require_pin_permission) ==========
+@router.post("/{conv_id}/messages/{msg_id}/pin", response_model=None)
+async def pin_message(
+    conv_id: UUID,
+    msg_id: UUID,
+    current_user = Depends(require_pin_permission),
+    service: PinnedMessageService = Depends(get_pinned_message_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    user_id = current_user.get("user_id")
+    if not org_id or not user_id:
+        raise HTTPException(403, "Authentication required")
+    try:
+        return await service.pin_message(conv_id, msg_id, UUID(user_id), UUID(org_id))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        logger.error(f"Error pinning message: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.delete("/{conv_id}/messages/{msg_id}/pin", response_model=None)
+async def unpin_message(
+    conv_id: UUID,
+    msg_id: UUID,
+    current_user = Depends(require_pin_permission),
+    service: PinnedMessageService = Depends(get_pinned_message_service)
+) -> Any:
+    org_id = current_user.get("org_id")
+    user_id = current_user.get("user_id")
+    if not org_id or not user_id:
+        raise HTTPException(403, "Authentication required")
+    try:
+        return await service.unpin_message(conv_id, msg_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error unpinning message: {e}")
+        raise HTTPException(500, "Internal server error")
+
+@router.get("/{conv_id}/pins", response_model=None)
+async def get_pinned_messages(
+    conv_id: UUID,
+    current_user = Depends(get_current_user),
+    service: PinnedMessageService = Depends(get_pinned_message_service)
+) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
+    org_id = current_user.get("org_id")
+    if not org_id:
+        raise HTTPException(403, "Organization not found")
+    try:
+        return await service.get_pinned_messages(conv_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error fetching pinned messages: {e}")
+        raise HTTPException(500, "Internal server error")
+
 @router.post("/{conv_id}/messages", response_model=None)
 async def send_message(
     conv_id: UUID,
@@ -167,6 +258,10 @@ async def send_message(
     db: AsyncSession = Depends(get_db),
     service: Any = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     user_id = current_user.get("user_id")
     user_role = current_user.get("role")
@@ -198,7 +293,7 @@ async def send_message(
         logger.error(f"Error sending message: {e}")
         raise HTTPException(500, "Internal server error")
 
-# ==================== MEDIA UPLOAD ENDPOINT (unchanged) ====================
+# ==================== MEDIA UPLOAD ENDPOINT ====================
 @router.post("/{conv_id}/media", response_model=None)
 async def upload_media(
     conv_id: UUID,
@@ -209,6 +304,10 @@ async def upload_media(
     db: AsyncSession = Depends(get_db),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     if reply_to_id:
         original = await db.execute(
             select(Message).where(
@@ -294,7 +393,7 @@ async def upload_media(
         media_file_name=file.filename,
         media_content_type=mime_type,
         media_file_size=file.size,
-        status_updated_at=now_utc  # <-- Phase 3: initial timestamp
+        status_updated_at=now_utc
     )
     db.add(temp_message)
     await db.flush()
@@ -315,7 +414,7 @@ async def upload_media(
     except Exception as e:
         logger.error(f"WhatsApp upload failed: {e}")
         temp_message.status = "failed"
-        temp_message.status_updated_at = datetime.now(timezone.utc)  # <-- Phase 3
+        temp_message.status_updated_at = datetime.now(timezone.utc)
         await db.commit()
         raise HTTPException(502, f"WhatsApp upload error: {str(e)}")
 
@@ -331,14 +430,14 @@ async def upload_media(
         )
         if not success:
             temp_message.status = "failed"
-            temp_message.status_updated_at = datetime.now(timezone.utc)  # <-- Phase 3
+            temp_message.status_updated_at = datetime.now(timezone.utc)
             await db.commit()
             raise HTTPException(502, "Failed to send media message")
         logger.info(f"Media message sent, wamid: {wamid}")
     except Exception as e:
         logger.error(f"Failed to send media message: {e}")
         temp_message.status = "failed"
-        temp_message.status_updated_at = datetime.now(timezone.utc)  # <-- Phase 3
+        temp_message.status_updated_at = datetime.now(timezone.utc)
         await db.commit()
         raise HTTPException(502, f"Failed to send media: {str(e)}")
 
@@ -348,7 +447,7 @@ async def upload_media(
     temp_message.status = "sent"
     temp_message.whatsapp_message_id = wamid
     temp_message.media_whatsapp_id = media_id
-    temp_message.status_updated_at = datetime.now(timezone.utc)  # <-- Phase 3
+    temp_message.status_updated_at = datetime.now(timezone.utc)
 
     # Try immediate download (optional)
     local_path = None
@@ -394,6 +493,10 @@ async def send_location(
     current_user = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     user_id = current_user.get("user_id")
     if not org_id or not user_id:
@@ -451,7 +554,8 @@ async def send_location(
         "message_id": str(message.id),
         "whatsapp_message_id": wamid,
         "status": "sent"
-    }    
+    }
+
 # ---------- Media Fetch Endpoint ----------
 @router.get("/{conv_id}/media/{message_id}", response_model=None)
 async def fetch_message_media(
@@ -460,6 +564,10 @@ async def fetch_message_media(
     db: Any = Depends(get_db),
     current_user = Depends(get_current_user)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -521,7 +629,7 @@ async def fetch_message_media(
         logger.error(f"Error fetching media: {e}")
         raise HTTPException(500, "Internal server error")
 
-# ---------- Assignment Routes (unchanged) ----------
+# ---------- Assignment Routes ----------
 @router.post("/{conv_id}/assign", response_model=None)
 async def assign_agent(
     conv_id: UUID,
@@ -529,6 +637,10 @@ async def assign_agent(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     user_id = current_user.get("user_id")
     if not org_id:
@@ -548,6 +660,10 @@ async def unassign_agent(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     user_id = current_user.get("user_id")
     if not org_id:
@@ -566,6 +682,10 @@ async def list_agents(
     db: Any = Depends(get_db),
     current_user = Depends(get_current_user)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -600,6 +720,10 @@ async def toggle_mode(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -612,13 +736,17 @@ async def toggle_mode(
         logger.error(f"Error toggling mode: {e}")
         raise HTTPException(500, "Internal server error")
 
-# ---------- Notes Routes (unchanged) ----------
+# ---------- Notes Routes ----------
 @router.get("/{conv_id}/notes", response_model=None)
 async def get_notes(
     conv_id: UUID,
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -637,6 +765,10 @@ async def add_note(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     user_id = current_user.get("user_id")
     if not org_id or not user_id:
@@ -649,12 +781,16 @@ async def add_note(
         logger.error(f"Error adding note: {e}")
         raise HTTPException(500, "Internal server error")
 
-# ---------- Tags Routes (unchanged) ----------
+# ---------- Tags Routes ----------
 @router.get("/tags", response_model=None)
 async def list_tags(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -670,6 +806,10 @@ async def create_tag(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -686,6 +826,10 @@ async def attach_tag(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -705,6 +849,10 @@ async def detach_tag(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -727,6 +875,10 @@ async def get_conversation_tags(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -738,7 +890,7 @@ async def get_conversation_tags(
         logger.error(f"Error getting conversation tags: {e}")
         raise HTTPException(500, "Internal server error")
 
-# ---------- Additional endpoints (counts, mark-read, etc.) ----------
+# ---------- Additional endpoints ----------
 class MetadataUpdate(BaseModel):
     metadata: Dict[str, Any]
 
@@ -750,6 +902,11 @@ async def get_conversation_counts(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    # Check permission manually
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions to view conversation counts")
+    
     org_id = current_user.get("org_id")
     user_id = current_user.get("user_id")
     user_role = current_user.get("role")
@@ -764,6 +921,10 @@ async def mark_conversation_read(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -776,6 +937,10 @@ async def get_assignment_history(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -798,6 +963,10 @@ async def update_conversation_custom_fields(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -817,6 +986,10 @@ async def update_customer_optin(
     current_user = Depends(get_current_user),
     service: ConversationService = Depends(get_conversation_service)
 ) -> Any:
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     org_id = current_user.get("org_id")
     if not org_id:
         raise HTTPException(403, "Organization not found")
@@ -837,6 +1010,10 @@ async def set_conversation_mode(
     current_user: dict = Depends(get_current_user)
 ):
     """Change conversation reply mode: ai, human, rule, bot"""
+    permissions = current_user.get("permissions", [])
+    if "manage_conversations" not in permissions and current_user.get("role") != "super_admin":
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    
     conv = await db.get(Conversation, conv_id)
     if not conv:
         raise HTTPException(404, "Conversation not found")
