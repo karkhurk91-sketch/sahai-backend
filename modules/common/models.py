@@ -91,6 +91,10 @@ class Customer(Base):
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
     opt_in = Column(Boolean, default=False)
     profile_picture = Column(String(500), nullable=True)
+    conversations = relationship("Conversation", back_populates="customer", foreign_keys="Conversation.customer_id", lazy="select")
+    leads = relationship("Lead", back_populates="customer", foreign_keys="Lead.customer_id", lazy="select")
+    bookings = relationship("Booking", back_populates="customer", foreign_keys="Booking.customer_id", lazy="select")
+    customer_group_members = relationship("CustomerGroupMember", back_populates="customer", foreign_keys="CustomerGroupMember.customer_id", lazy="select")
     __table_args__ = (
         Index("ix_customers_org_phone", organization_id, phone_number, unique=True),
     )
@@ -158,6 +162,9 @@ class Conversation(Base):
     booking_status = Column(String(50), nullable=True)  # pending, confirmed, cancelled, completed
     recommendation_shown = Column(Boolean, default=False)  # Track if recommendation was already shown
     last_intent = Column(String(100), nullable=True)  # Last detected intent (not LLM-driven)
+    customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, index=True)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+    customer = relationship("Customer", back_populates="conversations", foreign_keys=[customer_id])
     
 class Message(Base):
     __tablename__ = "messages"
@@ -249,6 +256,9 @@ class Lead(Base):
     nurturing_logs = relationship("LeadNurturingLog", back_populates="lead", cascade="all, delete-orphan")
     conversation = relationship("Conversation", foreign_keys=[conversation_id], backref="lead")
     duplicate_checked = Column(Boolean, default=False)
+    customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, index=True)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+    customer = relationship("Customer", back_populates="leads", foreign_keys=[customer_id])
 
 class AIConfig(Base):
     __tablename__ = "ai_configurations"
@@ -312,6 +322,9 @@ class Booking(Base):
     reminder_sent = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id", ondelete="SET NULL"), nullable=True, index=True)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+    customer = relationship("Customer", back_populates="bookings", foreign_keys=[customer_id])
 
 class OrganizationPrompt(Base):
     __tablename__ = "organization_prompts"
@@ -466,6 +479,8 @@ class CustomerGroupMember(Base):
     group_id = Column(UUID(as_uuid=True), ForeignKey("customer_groups.id", ondelete="CASCADE"), primary_key=True)
     customer_id = Column(UUID(as_uuid=True), ForeignKey("customers.id", ondelete="CASCADE"), primary_key=True)
     added_at = Column(DateTime(timezone=True), server_default=func.now())
+    deleted_at = Column(DateTime(timezone=True), nullable=True) 
+    customer = relationship("Customer", back_populates="customer_group_members", foreign_keys=[customer_id])
 
 # Add this class to your existing models.py (after ConversationNote or at the end)
 

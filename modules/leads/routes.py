@@ -12,6 +12,7 @@ from uuid import UUID
 from datetime import datetime
 from modules.auth.routes import get_current_user
 from modules.auth.dependencies import require_permission
+from modules.common.utils.customer_utils import link_customer_to_record
 
 import uuid
 

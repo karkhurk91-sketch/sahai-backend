@@ -10,9 +10,14 @@ from pydantic import BaseModel
 from uuid import UUID
 from typing import List, Optional
 from datetime import datetime
+from modules.customers.services.customer_service import CustomerService
+from modules.common.logger import get_logger
+
 import pandas as pd
 
-router = APIRouter(prefix="/api/customers", tags=["Customers"], dependencies=[Depends(require_permission("manage_customers"))])
+
+router = APIRouter(prefix="/api/customers", tags=["Customers"])
+logger = get_logger(__name__)
 
 class CustomerCreate(BaseModel):
     phone_number: str
@@ -25,18 +30,21 @@ class CustomerUpdate(BaseModel):
     email: Optional[str] = None
     notes: Optional[str] = None
 
-async def require_org_admin_or_agent(current_user):
-    role = current_user.get("role")
-    if role not in ["org_admin", "agent"]:
-        raise HTTPException(403, "Permission denied")
+# ---------- Custom permission ----------
+async def require_customer_permission(current_user = Depends(get_current_user)):
+    permissions = current_user.get("permissions", [])
+    if "manage_customers" in permissions or current_user.get("role") == "super_admin":
+        return current_user
+    raise HTTPException(status_code=403, detail="Insufficient permissions for customer operations")
 
+# ---------- List Customers ----------
 @router.get("")
 async def list_customers(
     page: int = 1,
     limit: int = 50,
     search: Optional[str] = None,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(require_customer_permission)
 ):
     org_id = current_user["org_id"]
 
@@ -89,14 +97,14 @@ async def list_customers(
         "page": page
     }
 
+# ---------- Create Customer ----------
 @router.post("")
 async def create_customer(
     cust: CustomerCreate,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(require_customer_permission)
 ):
-
-    if current_user.get("role") != "org_admin":
+    if current_user.get("role") != "org_admin" and current_user.get("role") != "super_admin":
         raise HTTPException(403, "Only organization admin can delete customers")
         
     new_cust = Customer(
@@ -111,15 +119,15 @@ async def create_customer(
     await db.refresh(new_cust)
     return new_cust
 
+# ---------- Update Customer ----------
 @router.put("/{customer_id}")
 async def update_customer(
     customer_id: UUID,
     update_data: CustomerUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(require_customer_permission)
 ):
-
-    if current_user.get("role") != "org_admin":
+    if current_user.get("role") != "org_admin" and current_user.get("role") != "super_admin":
         raise HTTPException(403, "Only organization admin can delete customers")
 
     stmt = update(Customer).where(
@@ -131,25 +139,13 @@ async def update_customer(
     await db.commit()
     return {"status": "updated"}
 
-@router.delete("/{customer_id}")
-async def delete_customer(
+# ---------- Toggle Status ----------
+@router.put("/{customer_id}/status")
+async def toggle_customer_status(
     customer_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(require_customer_permission)
 ):
-    if current_user.get("role") != "org_admin":
-        raise HTTPException(403, "Only organization admin can delete customers")
-
-    stmt = update(Customer).where(
-        Customer.id == customer_id,
-        Customer.organization_id == current_user["org_id"]
-    ).values(deleted_at=datetime.utcnow())
-    await db.execute(stmt)
-    await db.commit()
-    return {"status": "deleted"}
-
-@router.put("/{customer_id}/status")
-async def toggle_customer_status(customer_id: UUID, db: AsyncSession = Depends(get_db)):
     stmt = update(Customer).where(Customer.id == customer_id).values(
         is_active=~Customer.is_active
     )
@@ -157,11 +153,12 @@ async def toggle_customer_status(customer_id: UUID, db: AsyncSession = Depends(g
     await db.commit()
     return {"status": "updated"}
 
+# ---------- Upload CSV ----------
 @router.post("/upload")
 async def upload_customers(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user = Depends(require_customer_permission)
 ):
     df = pd.read_csv(file.file) if file.filename.endswith(".csv") else pd.read_excel(file.file)
 
@@ -183,3 +180,27 @@ async def upload_customers(
     await db.commit()
 
     return {"message": f"{len(customers)} customers uploaded"}
+
+# ---------- Dependency for CustomerService ----------
+def get_customer_service() -> CustomerService:
+    return CustomerService()  # adjust if dependency injection is used
+
+# ---------- DELETE Customer (Cascading Soft‑Delete) ----------
+@router.delete("/{customer_id}")
+async def delete_customer(
+    customer_id: UUID,
+    current_user = Depends(require_customer_permission),
+    db: AsyncSession = Depends(get_db),
+    service: CustomerService = Depends(get_customer_service)
+):
+    user_id = current_user.get("user_id")
+    if not user_id:
+        raise HTTPException(403, "Authentication required")
+    try:
+        await service.soft_delete_customer(db, customer_id, UUID(user_id))
+        return {"message": "Customer and all related records soft‑deleted"}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        logger.error(f"Error deleting customer {customer_id}: {e}")
+        raise HTTPException(500, "Internal server error")

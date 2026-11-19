@@ -1,7 +1,7 @@
 import asyncio
 from typing import List, Optional, Dict, Any
 from uuid import UUID
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc, delete as sql_delete, func, update, and_, or_, cast, String
 
@@ -13,6 +13,7 @@ from modules.message.sender import get_whatsapp_config, WhatsAppService
 from ..repositories import ConversationRepository, MessageRepository, TagRepository, ConversationTagRepository, ConversationNoteRepository
 from ..utils import get_media_type_and_limit
 from datetime import datetime, timedelta, timezone
+from modules.common.utils.customer_utils import link_customer_to_record
 
 
 logger = get_logger(__name__)
@@ -446,6 +447,10 @@ class ConversationService:
     async def create_or_get_conversation(self, phone_number: str, org_id: UUID) -> Dict[str, Any]:
         existing = await self.conv_repo.get_by_phone_and_org(phone_number, org_id)
         if existing:
+            # Try to link customer if not already linked
+            if not existing.customer_id:
+                await link_customer_to_record(self.session, org_id, phone_number, existing)
+                await self.session.commit()
             return {
                 "id": str(existing.id),
                 "customer_phone_number": existing.customer_phone_number,
@@ -455,6 +460,7 @@ class ConversationService:
                 "reply_mode": existing.reply_mode,
                 "status": existing.status,
             }
+
         conv = Conversation(
             customer_phone_number=phone_number,
             organization_id=org_id,
@@ -462,7 +468,10 @@ class ConversationService:
             status="active",
             last_message_at=datetime.now(timezone.utc)
         )
+        # Link to customer before saving
+        await link_customer_to_record(self.session, org_id, phone_number, conv)
         conv = await self.conv_repo.create(conv)
+
         return {
             "id": str(conv.id),
             "customer_phone_number": conv.customer_phone_number,

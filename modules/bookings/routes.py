@@ -8,6 +8,8 @@ from modules.auth.dependencies import require_permission
 from datetime import datetime, timedelta
 from typing import Optional
 from uuid import UUID
+from modules.common.utils.customer_utils import link_customer_to_record
+
 
 router = APIRouter(prefix="/api/bookings", tags=["Bookings"], dependencies=[Depends(require_permission("manage_bookings"))])
 
